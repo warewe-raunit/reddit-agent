@@ -94,6 +94,7 @@ async def upvote(
 
     # Capture token from early network events BEFORE navigation
     _early_tokens: list[str] = []
+    _vote_responses: list[dict] = []
 
     def _early_listener(request) -> None:
         auth = request.headers.get("authorization", "")
@@ -102,7 +103,22 @@ async def upvote(
             if len(t) > 20:
                 _early_tokens.append(t)
 
+    async def _capture_vote_response(response) -> None:
+        url = response.url
+        if "reddit.com" not in url.lower() or "vote" not in url.lower():
+            return
+        item = {"url": url, "status": response.status}
+        try:
+            item["body"] = (await response.text())[:300]
+        except Exception:
+            item["body"] = ""
+        _vote_responses.append(item)
+
+    def _vote_response_listener(response) -> None:
+        asyncio.create_task(_capture_vote_response(response))
+
     page.on("request", _early_listener)
+    page.on("response", _vote_response_listener)
 
     try:
         await page.goto(post_url, wait_until="domcontentloaded", timeout=60_000)
@@ -140,6 +156,8 @@ async def upvote(
 
         click_used = False
         server_verified = False
+        ui_verified_after_reload = False
+        score_after_reload = None
         post_id = None
 
         if post_data and post_data.get("postId"):
@@ -271,7 +289,7 @@ async def upvote(
         await page.mouse.click(click_x, click_y)
         click_used = True
 
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(4.0, 7.0))
 
         # Verify vote state changed in the page first; this mirrors what a human sees.
         verified = await page.evaluate("""() => {
@@ -299,9 +317,44 @@ async def upvote(
                 log.warning("reddit.upvote.server_verify_failed", error=str(verify_exc))
                 setattr(page, "_reddit_bearer_token", None)
 
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=60_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            reload_state = await page.evaluate("""() => {
+                const post = document.querySelector('shreddit-post')
+                    || document.querySelector('[data-testid="post-container"]');
+                if (!post) return { verified: false, score: null };
+                const actionRow = post.querySelector('shreddit-post-action-row');
+                let verified = false;
+                if (actionRow) {
+                    const voteState = (actionRow.getAttribute('vote-state') || '').toUpperCase();
+                    verified = voteState === 'UP';
+                }
+                if (!verified) {
+                    const upvotedBtns = post.querySelectorAll('[aria-pressed="true"], .upvoted, [class*="upvoted"]');
+                    verified = upvotedBtns.length > 0;
+                }
+                return { verified, score: post.getAttribute('score') };
+            }""")
+            ui_verified_after_reload = reload_state.get("verified") is True
+            score_after_reload = reload_state.get("score")
+            log.info(
+                "reddit.upvote.state_after_reload",
+                ui_verified_after_reload=ui_verified_after_reload,
+                score_before=post_data.get("score") if post_data else None,
+                score_after=score_after_reload,
+                vote_responses=_vote_responses[-3:],
+            )
+        except Exception as reload_exc:
+            log.warning("reddit.upvote.reload_verify_failed", error=str(reload_exc))
+
         elapsed = _ms() - start_ms
 
-        final_verified = server_verified or verified
+        final_verified = server_verified or ui_verified_after_reload
 
         if db is not None:
             try:
@@ -316,10 +369,29 @@ async def upvote(
                 log.warning("reddit.upvote.db_log_failed", error=str(db_exc))
 
         if not final_verified:
-            raise RuntimeError("upvote was not confirmed by Reddit UI or server vote state")
+            raise RuntimeError(
+                "upvote was not confirmed after reload or by Reddit server vote state; "
+                f"optimistic_ui={verified}, vote_responses={_vote_responses[-3:]}"
+            )
 
-        log.info("reddit.upvote.success", elapsed_ms=elapsed, click_used=click_used, server_verified=server_verified)
-        return _ok({"api_used": False, "click_used": click_used, "verified": final_verified, "server_verified": server_verified})
+        log.info(
+            "reddit.upvote.success",
+            elapsed_ms=elapsed,
+            click_used=click_used,
+            server_verified=server_verified,
+            ui_verified_after_reload=ui_verified_after_reload,
+        )
+        return _ok({
+            "api_used": False,
+            "click_used": click_used,
+            "verified": final_verified,
+            "ui_verified_before_reload": verified,
+            "ui_verified_after_reload": ui_verified_after_reload,
+            "server_verified": server_verified,
+            "score_before": post_data.get("score") if post_data else None,
+            "score_after_reload": score_after_reload,
+            "vote_responses": _vote_responses[-3:],
+        })
 
     except Exception as exc:
         elapsed = _ms() - start_ms
@@ -339,6 +411,10 @@ async def upvote(
     finally:
         try:
             page.remove_listener("request", _early_listener)
+        except Exception:
+            pass
+        try:
+            page.remove_listener("response", _vote_response_listener)
         except Exception:
             pass
 
