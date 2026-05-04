@@ -3,15 +3,14 @@ tools/upvote_tool.py — Reddit upvote tool for AI agents.
 
 Stealth features:
 - Bearer token captured via early network listener BEFORE page.goto()
-- OAuth token can be supplied via REDDIT_OAUTH_ACCESS_TOKEN
-- API vote via page.request.post() — bypasses CORS, operates at CDP level
-- Trusted mouse click fallback (isTrusted=true events, not dispatchEvent)
+- OAuth token can be supplied via REDDIT_OAUTH_ACCESS_TOKEN for verification
+- Trusted mouse click is the primary vote action (isTrusted=true events)
 - Shadow DOM traversal to find upvote button in shreddit-post-action-row
 - simulate_reading() before acting
 
 Usage:
     result = await run_tool(page, account_id, post_url="https://reddit.com/r/...")
-    # result: {success: bool, data: {api_used, already_upvoted, new_score}, error: str|None}
+    # result: {success: bool, data: {click_used, verified, already_upvoted?}, error: str|None}
 """
 
 from __future__ import annotations
@@ -87,8 +86,8 @@ async def upvote(
 ) -> dict:
     """Navigate to a post and upvote it.
 
-    Uses Reddit's internal OAuth API for the actual vote (reliable),
-    with trusted mouse click as fallback.
+    Uses the visible Reddit upvote control as the primary action, matching the
+    normal browser flow. OAuth/API calls are used only to verify server state.
     """
     log = logger.bind(account_id=account_id, action="UPVOTE")
     start_ms = _ms()
@@ -139,201 +138,170 @@ async def upvote(
             return { postId: post.getAttribute('id'), score: post.getAttribute('score') };
         }""")
 
-        api_success = False
+        click_used = False
         server_verified = False
+        post_id = None
 
-        if post_data and post_data.get("postId") and token:
+        if post_data and post_data.get("postId"):
             raw_post_id = post_data["postId"]
             post_id = raw_post_id if raw_post_id.startswith("t3_") else f"t3_{raw_post_id}"
-            log.info("reddit.upvote.api_attempt", post_id=post_id)
 
+        # Trusted mouse click is the primary action. This keeps the vote inside
+        # Reddit's normal frontend event flow instead of posting directly first.
+        verified = False
+        log.info("reddit.upvote.trusted_click_primary")
+
+        btn_info = await page.evaluate("""() => {
+            const post = document.querySelector('shreddit-post')
+                || document.querySelector('[data-testid="post-container"]')
+                || document.querySelector('.Post');
+            if (!post) return { found: false, reason: 'post_not_found' };
+
+            const roots = [post];
+            if (post.shadowRoot) roots.push(post.shadowRoot);
+            const actionRow = post.querySelector('shreddit-post-action-row');
+            if (actionRow) {
+                const voteState = (actionRow.getAttribute('vote-state') || '').toUpperCase();
+                if (voteState === 'UP') return { found: true, already: true };
+                roots.push(actionRow);
+                if (actionRow.shadowRoot) roots.push(actionRow.shadowRoot);
+            }
+            const walker = document.createTreeWalker(post, NodeFilter.SHOW_ELEMENT);
+            let node = walker.currentNode;
+            while (node) { if (node.shadowRoot) roots.push(node.shadowRoot); node = walker.nextNode(); }
+
+            const selectors = [
+                'button[upvote]', 'button[data-click-id="upvote"]',
+                'button[data-testid="upvote-button"]', 'button[aria-label*="upvote" i]',
+                'faceplate-tracker[slot="upvote"] button', '[slot="upvote"] button',
+                'faceplate-vote-button[upvote] button', 'button[vote-direction="up"]',
+            ];
+
+            for (const root of roots) {
+                for (const sel of selectors) {
+                    const candidates = root.querySelectorAll(sel);
+                    for (const btn of candidates) {
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.width === 0 || rect.height === 0) continue;
+                        const isAlready = (
+                            btn.getAttribute('aria-pressed') === 'true' ||
+                            (btn.className || '').toString().toLowerCase().includes('upvoted') ||
+                            btn.closest('[vote-state="UP"]') !== null
+                        );
+                        if (isAlready) return { found: true, already: true };
+                        return {
+                            found: true, already: false,
+                            absY: rect.top + window.scrollY,
+                            absX: rect.left + window.scrollX,
+                            width: rect.width, height: rect.height,
+                            selector: sel, viewportHeight: window.innerHeight,
+                        };
+                    }
+                }
+            }
+            return { found: false, reason: 'not_found' };
+        }""")
+
+        if not btn_info or not btn_info.get("found"):
+            raise RuntimeError(f"Upvote button not found: {btn_info}")
+
+        if btn_info.get("already"):
+            log.info("reddit.upvote.already_upvoted")
+            elapsed = _ms() - start_ms
+            if db is not None:
+                try:
+                    safe_pid = await safe_proxy_id(db, proxy_id)
+                    await db.log_action(
+                        account_id=account_id, action_type="UPVOTE",
+                        result="SUCCESS", target_url=post_url,
+                        proxy_id=safe_pid, response_time_ms=elapsed,
+                    )
+                except Exception:
+                    pass
+            return _ok({"already_upvoted": True, "api_used": False, "click_used": False})
+
+        # Scroll button into viewport center, then click with trusted event
+        target_scroll_y = btn_info["absY"] - (btn_info["viewportHeight"] / 2)
+        await page.evaluate(
+            "(scrollTo) => window.scrollTo({ top: scrollTo, behavior: 'instant' })",
+            target_scroll_y,
+        )
+        await asyncio.sleep(1.0)
+
+        # Re-read fresh coordinates after scroll
+        fresh_coords = await page.evaluate("""(sel) => {
+            const post = document.querySelector('shreddit-post')
+                || document.querySelector('[data-testid="post-container"]')
+                || document.querySelector('.Post');
+            if (!post) return null;
+            const roots = [post];
+            if (post.shadowRoot) roots.push(post.shadowRoot);
+            const actionRow = post.querySelector('shreddit-post-action-row');
+            if (actionRow) {
+                roots.push(actionRow);
+                if (actionRow.shadowRoot) roots.push(actionRow.shadowRoot);
+            }
+            const walker = document.createTreeWalker(post, NodeFilter.SHOW_ELEMENT);
+            let node = walker.currentNode;
+            while (node) { if (node.shadowRoot) roots.push(node.shadowRoot); node = walker.nextNode(); }
+            const candidates = [];
+            for (const root of roots) {
+                const els = root.querySelectorAll(sel);
+                candidates.push(...els);
+            }
+            for (const btn of candidates) {
+                const rect = btn.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                }
+            }
+            return null;
+        }""", btn_info["selector"])
+
+        click_x = int(fresh_coords["x"]) if fresh_coords else int(btn_info["absX"] + btn_info["width"] / 2)
+        click_y = int(fresh_coords["y"]) if fresh_coords else int(btn_info["absY"] - target_scroll_y + btn_info["height"] / 2)
+
+        # Human-like mouse approach before click
+        approach_x = click_x + random.randint(-30, 30)
+        approach_y = click_y + random.randint(-20, 20)
+        await page.mouse.move(approach_x, approach_y, steps=random.randint(5, 15))
+        await asyncio.sleep(random.uniform(0.1, 0.4))
+        await page.mouse.move(click_x, click_y, steps=random.randint(3, 8))
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+        await page.mouse.click(click_x, click_y)
+        click_used = True
+
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+
+        # Verify vote state changed in the page first; this mirrors what a human sees.
+        verified = await page.evaluate("""() => {
+            const post = document.querySelector('shreddit-post')
+                || document.querySelector('[data-testid="post-container"]');
+            if (!post) return false;
+            const actionRow = post.querySelector('shreddit-post-action-row');
+            if (actionRow) {
+                const voteState = (actionRow.getAttribute('vote-state') || '').toUpperCase();
+                if (voteState === 'UP') return true;
+            }
+            const upvotedBtns = post.querySelectorAll('[aria-pressed="true"], .upvoted, [class*="upvoted"]');
+            return upvotedBtns.length > 0;
+        }""")
+        log.info("reddit.upvote.trusted_click_done", verified=verified)
+
+        if token and post_id:
             try:
                 if not await _verify_oauth_token(page, token, user_agent):
                     raise RuntimeError("oauth token rejected by /api/v1/me")
-
-                api_response = await page.request.post(
-                    "https://oauth.reddit.com/api/vote",
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Authorization": f"Bearer {token}",
-                        "User-Agent": user_agent,
-                    },
-                    data=f"id={post_id}&dir=1&rank=2",
-                )
-                result = {"status": api_response.status, "body": (await api_response.text())[:300]}
-            except Exception as req_exc:
-                result = {"error": str(req_exc)}
-
-            if result.get("status") == 200:
-                log.info("reddit.upvote.api_success", post_id=post_id)
-                api_success = True
                 await asyncio.sleep(2)
-                server_verified = await _verify_vote_state(page, token, user_agent, post_id) is True
-                await page.reload(wait_until="domcontentloaded")
-                await asyncio.sleep(3)
-                new_score = await page.evaluate("""() => {
-                    const post = document.querySelector('shreddit-post');
-                    return post ? post.getAttribute('score') || '0' : '0';
-                }""")
-                log.info("reddit.upvote.score_after_reload",
-                         before=post_data.get("score"), after=new_score,
-                         server_verified=server_verified)
-            elif result.get("status") in (401, 403):
-                log.warning("reddit.upvote.token_rejected", status=result.get("status"))
-                setattr(page, "_reddit_bearer_token", None)
-            elif result.get("error"):
-                log.warning("reddit.upvote.api_error", error=result.get("error"))
-
-        # Trusted mouse click fallback
-        verified = False
-        if not api_success:
-            log.info("reddit.upvote.falling_back_to_trusted_click")
-
-            btn_info = await page.evaluate("""() => {
-                const post = document.querySelector('shreddit-post')
-                    || document.querySelector('[data-testid="post-container"]')
-                    || document.querySelector('.Post');
-                if (!post) return { found: false, reason: 'post_not_found' };
-
-                const roots = [post];
-                if (post.shadowRoot) roots.push(post.shadowRoot);
-                const actionRow = post.querySelector('shreddit-post-action-row');
-                if (actionRow) {
-                    const voteState = (actionRow.getAttribute('vote-state') || '').toUpperCase();
-                    if (voteState === 'UP') return { found: true, already: true };
-                    roots.push(actionRow);
-                    if (actionRow.shadowRoot) roots.push(actionRow.shadowRoot);
-                }
-                const walker = document.createTreeWalker(post, NodeFilter.SHOW_ELEMENT);
-                let node = walker.currentNode;
-                while (node) { if (node.shadowRoot) roots.push(node.shadowRoot); node = walker.nextNode(); }
-
-                const selectors = [
-                    'button[upvote]', 'button[data-click-id="upvote"]',
-                    'button[data-testid="upvote-button"]', 'button[aria-label*="upvote" i]',
-                    'faceplate-tracker[slot="upvote"] button', '[slot="upvote"] button',
-                    'faceplate-vote-button[upvote] button', 'button[vote-direction="up"]',
-                ];
-
-                for (const root of roots) {
-                    for (const sel of selectors) {
-                        const candidates = root.querySelectorAll(sel);
-                        for (const btn of candidates) {
-                            const rect = btn.getBoundingClientRect();
-                            if (rect.width === 0 || rect.height === 0) continue;
-                            const isAlready = (
-                                btn.getAttribute('aria-pressed') === 'true' ||
-                                (btn.className || '').toString().toLowerCase().includes('upvoted') ||
-                                btn.closest('[vote-state="UP"]') !== null
-                            );
-                            if (isAlready) return { found: true, already: true };
-                            return {
-                                found: true, already: false,
-                                absY: rect.top + window.scrollY,
-                                absX: rect.left + window.scrollX,
-                                width: rect.width, height: rect.height,
-                                selector: sel, viewportHeight: window.innerHeight,
-                            };
-                        }
-                    }
-                }
-                return { found: false, reason: 'not_found' };
-            }""")
-
-            if not btn_info or not btn_info.get("found"):
-                raise RuntimeError(f"Upvote button not found: {btn_info}")
-
-            if btn_info.get("already"):
-                log.info("reddit.upvote.already_upvoted")
-                elapsed = _ms() - start_ms
-                if db is not None:
-                    try:
-                        safe_pid = await safe_proxy_id(db, proxy_id)
-                        await db.log_action(
-                            account_id=account_id, action_type="UPVOTE",
-                            result="SUCCESS", target_url=post_url,
-                            proxy_id=safe_pid, response_time_ms=elapsed,
-                        )
-                    except Exception:
-                        pass
-                return _ok({"already_upvoted": True, "api_used": False})
-
-            # Scroll button into viewport center, then click with trusted event
-            target_scroll_y = btn_info["absY"] - (btn_info["viewportHeight"] / 2)
-            await page.evaluate(
-                "(scrollTo) => window.scrollTo({ top: scrollTo, behavior: 'instant' })",
-                target_scroll_y,
-            )
-            await asyncio.sleep(1.0)
-
-            # Re-read fresh coordinates after scroll
-            fresh_coords = await page.evaluate("""(sel) => {
-                const post = document.querySelector('shreddit-post')
-                    || document.querySelector('[data-testid="post-container"]')
-                    || document.querySelector('.Post');
-                if (!post) return null;
-                const roots = [post];
-                if (post.shadowRoot) roots.push(post.shadowRoot);
-                const actionRow = post.querySelector('shreddit-post-action-row');
-                if (actionRow) {
-                    roots.push(actionRow);
-                    if (actionRow.shadowRoot) roots.push(actionRow.shadowRoot);
-                }
-                const walker = document.createTreeWalker(post, NodeFilter.SHOW_ELEMENT);
-                let node = walker.currentNode;
-                while (node) { if (node.shadowRoot) roots.push(node.shadowRoot); node = walker.nextNode(); }
-                const candidates = [];
-                for (const root of roots) {
-                    const els = root.querySelectorAll(sel);
-                    candidates.push(...els);
-                }
-                for (const btn of candidates) {
-                    const rect = btn.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-                    }
-                }
-                return null;
-            }""", btn_info["selector"])
-
-            click_x = int(fresh_coords["x"]) if fresh_coords else int(btn_info["absX"] + btn_info["width"] / 2)
-            click_y = int(fresh_coords["y"]) if fresh_coords else int(btn_info["absY"] - target_scroll_y + btn_info["height"] / 2)
-
-            # Human-like mouse approach before click
-            approach_x = click_x + random.randint(-30, 30)
-            approach_y = click_y + random.randint(-20, 20)
-            await page.mouse.move(approach_x, approach_y, steps=random.randint(5, 15))
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-            await page.mouse.move(click_x, click_y, steps=random.randint(3, 8))
-            await asyncio.sleep(random.uniform(0.05, 0.15))
-            await page.mouse.click(click_x, click_y)
-
-            await asyncio.sleep(random.uniform(1.5, 3.0))
-
-            # Verify vote state changed
-            verified = await page.evaluate("""() => {
-                const post = document.querySelector('shreddit-post')
-                    || document.querySelector('[data-testid="post-container"]');
-                if (!post) return false;
-                const actionRow = post.querySelector('shreddit-post-action-row');
-                if (actionRow) {
-                    const voteState = (actionRow.getAttribute('vote-state') || '').toUpperCase();
-                    if (voteState === 'UP') return true;
-                }
-                const upvotedBtns = post.querySelectorAll('[aria-pressed="true"], .upvoted, [class*="upvoted"]');
-                return upvotedBtns.length > 0;
-            }""")
-            log.info("reddit.upvote.trusted_click_done", verified=verified)
-            if token and post_data and post_data.get("postId"):
-                await asyncio.sleep(2)
-                raw_post_id = post_data["postId"]
-                post_id = raw_post_id if raw_post_id.startswith("t3_") else f"t3_{raw_post_id}"
                 server_verified = await _verify_vote_state(page, token, user_agent, post_id) is True
                 log.info("reddit.upvote.server_vote_state_after_click", server_verified=server_verified)
+            except Exception as verify_exc:
+                log.warning("reddit.upvote.server_verify_failed", error=str(verify_exc))
+                setattr(page, "_reddit_bearer_token", None)
 
         elapsed = _ms() - start_ms
 
-        final_verified = server_verified or (not token and verified)
+        final_verified = server_verified or verified
 
         if db is not None:
             try:
@@ -347,11 +315,11 @@ async def upvote(
             except Exception as db_exc:
                 log.warning("reddit.upvote.db_log_failed", error=str(db_exc))
 
-        if token and not server_verified:
-            raise RuntimeError("upvote was not confirmed by Reddit server vote state")
+        if not final_verified:
+            raise RuntimeError("upvote was not confirmed by Reddit UI or server vote state")
 
-        log.info("reddit.upvote.success", elapsed_ms=elapsed, api_used=api_success, server_verified=server_verified)
-        return _ok({"api_used": api_success, "verified": final_verified, "server_verified": server_verified})
+        log.info("reddit.upvote.success", elapsed_ms=elapsed, click_used=click_used, server_verified=server_verified)
+        return _ok({"api_used": False, "click_used": click_used, "verified": final_verified, "server_verified": server_verified})
 
     except Exception as exc:
         elapsed = _ms() - start_ms
