@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 from urllib.parse import quote_plus, urlparse
 from langchain_core.tools import tool
@@ -16,6 +19,26 @@ from tools.browse_tool import warmup_browsing_session
 from tools.stealth.captcha import solve_login_recaptcha
 from session_store import delete_session, session_exists
 from browser_manager import LazyBrowser
+
+
+BUSINESS_WARMUP_SUBREDDITS = ["SaaS", "marketing", "sales"]
+WARMUP_START_LOCAL = time(9, 0)
+WARMUP_END_LOCAL = time(21, 30)
+
+WARMUP_PERSONA = {
+    "name": "Practical SaaS growth operator",
+    "voice": (
+        "short, casual, founder/operator vibe; curious but not salesy; uses light Reddit phrasing "
+        "like 'imo', 'tbh', 'ngl', 'solid point', or 'been there' only when it fits"
+    ),
+    "rules": [
+        "Write 1-3 short sentences.",
+        "No polished essay structure.",
+        "No fake personal claims or made-up results.",
+        "Ask a useful follow-up when the thread needs more context.",
+        "Do not post automatically; user approval is required.",
+    ],
+}
 
 
 def _proxy_config(proxy_url: Optional[str]) -> Optional[dict]:
@@ -41,6 +64,96 @@ def _captcha_config_for_login() -> Optional[dict]:
     }
 
 
+def _normalize_subreddits(subreddits: str = "") -> list[str]:
+    allowed = {name.lower(): name for name in BUSINESS_WARMUP_SUBREDDITS}
+    parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
+    selected = [allowed[s.lower()] for s in parsed if s.lower() in allowed]
+    return selected or BUSINESS_WARMUP_SUBREDDITS.copy()
+
+
+def _subreddit_from_reddit_url(url: str) -> Optional[str]:
+    match = re.search(r"reddit\.com/r/([^/]+)/", url, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _allowed_comment_target(post_url: str) -> tuple[bool, str]:
+    subreddit = _subreddit_from_reddit_url(post_url)
+    if not subreddit:
+        return False, "I can only comment when the Reddit URL includes a subreddit path like /r/SaaS/."
+    allowed = {name.lower(): name for name in BUSINESS_WARMUP_SUBREDDITS}
+    if subreddit.lower() not in allowed:
+        allowed_text = ", ".join(f"r/{name}" for name in BUSINESS_WARMUP_SUBREDDITS)
+        return False, f"I am configured to comment only in {allowed_text}. This URL is for r/{subreddit}."
+    return True, allowed[subreddit.lower()]
+
+
+async def _detect_proxy_time_context(page) -> dict:
+    """Best-effort proxy-local time detection without exposing proxy credentials."""
+    detected = await page.evaluate("""async () => {
+        const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+        const endpoints = [
+            'https://ipapi.co/json/',
+            'http://ip-api.com/json/?fields=status,country,regionName,city,timezone,query'
+        ];
+        for (const url of endpoints) {
+            try {
+                const response = await fetch(url, { cache: 'no-store' });
+                if (!response.ok) continue;
+                const data = await response.json();
+                const timezone = data.timezone || data.time_zone || null;
+                if (timezone) {
+                    return {
+                        timezone,
+                        country: data.country_name || data.country || null,
+                        region: data.region || data.regionName || null,
+                        city: data.city || null,
+                        ip: data.ip || data.query || null,
+                        source: url,
+                        browserTimezone,
+                    };
+                }
+            } catch (_) {}
+        }
+        return { timezone: browserTimezone, source: 'browser', browserTimezone };
+    }""")
+
+    timezone = detected.get("timezone") or "UTC"
+    try:
+        local_now = datetime.now(ZoneInfo(timezone))
+    except Exception:
+        timezone = "UTC"
+        local_now = datetime.now(ZoneInfo("UTC"))
+
+    detected["timezone"] = timezone
+    detected["local_now"] = local_now.isoformat(timespec="seconds")
+    detected["local_day"] = local_now.strftime("%A")
+    detected["local_time"] = local_now.strftime("%H:%M")
+    return detected
+
+
+def _next_warmup_start(now: datetime) -> datetime:
+    candidate = datetime.combine(now.date(), WARMUP_START_LOCAL, tzinfo=now.tzinfo)
+    if now.time() < WARMUP_START_LOCAL:
+        return candidate
+    return candidate + timedelta(days=1)
+
+
+def _warmup_window_status(time_context: dict) -> dict:
+    timezone = time_context.get("timezone") or "UTC"
+    now = datetime.fromisoformat(time_context["local_now"])
+    in_window = WARMUP_START_LOCAL <= now.time() <= WARMUP_END_LOCAL
+    next_start = None if in_window else _next_warmup_start(now)
+    return {
+        "timezone": timezone,
+        "local_now": time_context.get("local_now"),
+        "local_day": time_context.get("local_day"),
+        "local_time": time_context.get("local_time"),
+        "in_warmup_window": in_window,
+        "window": f"{WARMUP_START_LOCAL.strftime('%H:%M')}-{WARMUP_END_LOCAL.strftime('%H:%M')}",
+        "next_warmup_start": next_start.isoformat(timespec="seconds") if next_start else None,
+    }
+
+
 def is_reddit_action_request(text: str) -> bool:
     lowered = text.lower()
     return any(
@@ -58,6 +171,8 @@ def is_reddit_action_request(text: str) -> bool:
             "warmup",
             "warm up",
             "karma",
+            "autonomous",
+            "persona",
         )
     )
 
@@ -182,6 +297,10 @@ async def comment_on_reddit_post(
     if not ok:
         return status
 
+    allowed, reason = _allowed_comment_target(post_url)
+    if not allowed:
+        return reason
+
     page = await lazy.get_page()
     result = await comment(page=page, account_id=account_id, post_url=post_url, text=text)
     if result["success"]:
@@ -275,12 +394,13 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         return f"Browse failed: {result['error']}"
 
     @tool
-    async def warmup_reddit(subreddits: str = "", duration_minutes: float = 5.0) -> str:
+    async def warmup_reddit(subreddits: str = "", duration_minutes: float = 5.0, force: bool = False) -> str:
         """
-        Run a browsing-only warm-up session across relevant subreddits.
+        Run a browsing-only warm-up session across business subreddits during proxy-local active hours.
         Args:
-            subreddits: Comma-separated subreddit names without r/. If empty, uses safe general communities.
+            subreddits: Comma-separated subreddit names without r/. Only SaaS, marketing, and sales are allowed.
             duration_minutes: Target warm-up time in minutes.
+            force: If true, run even outside the proxy-local warm-up window.
         This tool only browses/reads. It does not post, comment, vote, or farm karma.
         """
         page = await lazy.get_page()
@@ -288,26 +408,31 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         if login_error:
             return login_error
 
-        parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
-        if not parsed:
-            parsed = [
-                "NoStupidQuestions",
-                "AskReddit",
-                "CasualConversation",
-                "explainlikeimfive",
-                "todayilearned",
-            ]
+        parsed = _normalize_subreddits(subreddits)
+        time_context = await _detect_proxy_time_context(page)
+        window = _warmup_window_status(time_context)
+
+        if not force and not window["in_warmup_window"]:
+            return (
+                "Warm-up not started because it is outside the proxy-local active window. "
+                f"Proxy/browser timezone: {window['timezone']}; local time: {window['local_day']} "
+                f"{window['local_time']}; window: {window['window']}; next start: "
+                f"{window['next_warmup_start']}. Subreddits: {', '.join('r/' + s for s in parsed)}."
+            )
 
         safe_duration = max(1.0, min(float(duration_minutes or 5.0), 30.0))
         result = await warmup_browsing_session(
             page=page,
             account_id=account_id,
-            subreddits=parsed[:10],
+            subreddits=parsed,
             duration_minutes=safe_duration,
         )
         if result["success"]:
             await lazy.persist_session()
-            return f"Warm-up browsing complete. Data: {result['data']}"
+            data = result["data"]
+            data["proxy_time"] = window
+            data["persona"] = WARMUP_PERSONA
+            return f"Warm-up browsing complete. Data: {data}"
         return f"Warm-up browsing failed: {result['error']}"
 
     @tool
@@ -315,7 +440,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         """
         Find active posts where a human-approved helpful comment might make sense.
         Args:
-            subreddits: Comma-separated subreddit names without r/. If empty, uses general communities.
+            subreddits: Comma-separated subreddit names without r/. Only SaaS, marketing, and sales are allowed.
             max_posts: Maximum candidate posts to return.
         This tool does not submit comments. Use it to draft comments for user approval.
         """
@@ -324,9 +449,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         if login_error:
             return login_error
 
-        parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
-        if not parsed:
-            parsed = ["NoStupidQuestions", "AskReddit", "CasualConversation", "explainlikeimfive"]
+        parsed = _normalize_subreddits(subreddits)
 
         limit = max(1, min(int(max_posts or 8), 20))
         per_sub_limit = max(1, (limit + len(parsed) - 1) // len(parsed))
@@ -379,7 +502,11 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         if not candidates:
             return "No warm-up comment opportunities found."
 
-        lines = ["Warm-up comment opportunities. Draft comments only; do not post until the user approves:"]
+        lines = [
+            "Warm-up comment opportunities. Draft comments only; do not post until the user approves.",
+            f"Persona: {WARMUP_PERSONA['name']} - {WARMUP_PERSONA['voice']}",
+            "Draft style: 1-3 short sentences, casual Reddit wording, no fake claims.",
+        ]
         for idx, item in enumerate(candidates, start=1):
             if item.get("error"):
                 lines.append(f"{idx}. r/{item['subreddit']} failed: {item['error']}")
@@ -513,6 +640,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         login_error = await _ensure_logged_in(page)
         if login_error:
             return login_error
+        allowed, reason = _allowed_comment_target(post_url)
+        if not allowed:
+            return reason
         result = await reply(
             page=page,
             account_id=account_id,
