@@ -71,6 +71,12 @@ PERSONA_RELEVANCE_TERMS = {
 }
 WARMUP_START_LOCAL = time(9, 0)
 WARMUP_END_LOCAL = time(21, 30)
+ENFORCE_WARMUP_LOCAL_TIME = os.getenv("WARMUP_ENFORCE_LOCAL_TIME", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 WARMUP_PERSONA = {
     "name": "Tech, SaaS, sales, marketing, and systems enthusiast",
@@ -528,7 +534,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         time_context = await _detect_proxy_time_context(page)
         window = _warmup_window_status(time_context)
 
-        if not force and not window["in_warmup_window"]:
+        if ENFORCE_WARMUP_LOCAL_TIME and not force and not window["in_warmup_window"]:
             return (
                 "Warm-up not started because it is outside the proxy-local active window. "
                 f"Proxy/browser timezone: {window['timezone']}; local time: {window['local_day']} "
