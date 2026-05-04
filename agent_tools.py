@@ -204,6 +204,64 @@ def _warmup_window_status(time_context: dict) -> dict:
     }
 
 
+async def _discover_persona_subreddit_candidates(page, max_results: int = 8, query: str = "") -> list[dict]:
+    queries = [query.strip()] if query.strip() else PERSONA_DISCOVERY_QUERIES
+    limit = max(1, min(int(max_results or 8), 25))
+    candidates: dict[str, dict] = {}
+
+    for search_text in queries:
+        if len(candidates) >= limit:
+            break
+        url = f"https://www.reddit.com/search/?q={quote_plus(search_text)}&type=sr"
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+            found = await page.evaluate("""(searchText) => {
+                const seen = new Set();
+                const results = [];
+                const anchors = [...document.querySelectorAll('a[href^="/r/"], a[href*="reddit.com/r/"]')];
+                for (const anchor of anchors) {
+                    const href = anchor.href || anchor.getAttribute('href') || '';
+                    const match = href.match(/\\/r\\/([^\\/\\?#]+)/i);
+                    if (!match) continue;
+                    const name = decodeURIComponent(match[1]);
+                    if (!name || seen.has(name.toLowerCase())) continue;
+                    seen.add(name.toLowerCase());
+                    const container = anchor.closest('search-telemetry-tracker, faceplate-tracker, article, div');
+                    const text = ((container && container.innerText) || anchor.innerText || '').replace(/\\s+/g, ' ').trim();
+                    results.push({
+                        name,
+                        url: `https://www.reddit.com/r/${name}/`,
+                        context: text.slice(0, 260),
+                        query: searchText,
+                    });
+                    if (results.length >= 10) break;
+                }
+                return results;
+            }""", search_text)
+
+            for item in found:
+                name = item.get("name", "").strip()
+                if not name:
+                    continue
+                haystack = f"{name} {item.get('context', '')}".lower()
+                if any(term in haystack for term in PERSONA_RELEVANCE_TERMS):
+                    candidates.setdefault(name.lower(), item)
+                    if len(candidates) >= limit:
+                        break
+        except Exception as exc:
+            candidates.setdefault(f"error-{search_text}".lower(), {
+                "name": search_text,
+                "error": str(exc),
+            })
+
+    return list(candidates.values())[:limit]
+
+
 def is_reddit_action_request(text: str) -> bool:
     lowered = text.lower()
     return any(
@@ -446,13 +504,19 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         return f"Browse failed: {result['error']}"
 
     @tool
-    async def warmup_reddit(subreddits: str = "", duration_minutes: float = 5.0, force: bool = False) -> str:
+    async def warmup_reddit(
+        subreddits: str = "",
+        duration_minutes: float = 5.0,
+        force: bool = False,
+        auto_discover: bool = True,
+    ) -> str:
         """
         Run a browsing-only warm-up session across business subreddits during proxy-local active hours.
         Args:
             subreddits: Comma-separated subreddit names without r/. Only persona-matched tech, SaaS, sales, marketing, systems, startup, and product communities are allowed.
             duration_minutes: Target warm-up time in minutes.
             force: If true, run even outside the proxy-local warm-up window.
+            auto_discover: If true, search Reddit for adjacent persona communities and browse the relevant candidates.
         This tool only browses/reads. It does not post, comment, vote, or farm karma.
         """
         page = await lazy.get_page()
@@ -472,6 +536,20 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
                 f"{window['next_warmup_start']}. Subreddits: {', '.join('r/' + s for s in parsed)}."
             )
 
+        discovered: list[dict] = []
+        if auto_discover:
+            discovered = [
+                item
+                for item in await _discover_persona_subreddit_candidates(page, max_results=6)
+                if not item.get("error")
+            ]
+            known = {name.lower() for name in parsed}
+            for item in discovered:
+                name = item.get("name", "").strip()
+                if name and name.lower() not in known:
+                    parsed.append(name)
+                    known.add(name.lower())
+
         safe_duration = max(1.0, min(float(duration_minutes or 5.0), 30.0))
         result = await warmup_browsing_session(
             page=page,
@@ -484,6 +562,10 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             data = result["data"]
             data["proxy_time"] = window
             data["persona"] = WARMUP_PERSONA
+            data["auto_discovered_subreddits"] = [
+                {"name": item.get("name"), "query": item.get("query"), "url": item.get("url")}
+                for item in discovered
+            ]
             return f"Warm-up browsing complete. Data: {data}"
         return f"Warm-up browsing failed: {result['error']}"
 
@@ -568,94 +650,6 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
                 f"URL: {item['url']}\n"
                 f"Context: {item.get('context', '')[:300]}"
             )
-        await lazy.persist_session()
-        return "\n".join(lines)
-
-    @tool
-    async def discover_persona_subreddits(query: str = "", max_results: int = 12) -> str:
-        """
-        Search Reddit for additional subreddits that match the agent persona.
-        Args:
-            query: Optional search query. If empty, uses SaaS/sales/marketing/systems discovery queries.
-            max_results: Maximum candidate subreddit names to return.
-        This tool only discovers candidates. It does not join, post, comment, or vote.
-        """
-        page = await lazy.get_page()
-        login_error = await _ensure_logged_in(page)
-        if login_error:
-            return login_error
-
-        queries = [query.strip()] if query.strip() else PERSONA_DISCOVERY_QUERIES
-        limit = max(1, min(int(max_results or 12), 25))
-        candidates: dict[str, dict] = {}
-
-        for search_text in queries:
-            if len(candidates) >= limit:
-                break
-            url = f"https://www.reddit.com/search/?q={quote_plus(search_text)}&type=sr"
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=8_000)
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1500)
-                found = await page.evaluate("""(searchText) => {
-                    const seen = new Set();
-                    const results = [];
-                    const anchors = [...document.querySelectorAll('a[href^="/r/"], a[href*="reddit.com/r/"]')];
-                    for (const anchor of anchors) {
-                        const href = anchor.href || anchor.getAttribute('href') || '';
-                        const match = href.match(/\\/r\\/([^\\/\\?#]+)/i);
-                        if (!match) continue;
-                        const name = decodeURIComponent(match[1]);
-                        if (!name || seen.has(name.toLowerCase())) continue;
-                        seen.add(name.toLowerCase());
-                        const container = anchor.closest('search-telemetry-tracker, faceplate-tracker, article, div');
-                        const text = ((container && container.innerText) || anchor.innerText || '').replace(/\\s+/g, ' ').trim();
-                        results.push({
-                            name,
-                            url: `https://www.reddit.com/r/${name}/`,
-                            context: text.slice(0, 260),
-                            query: searchText,
-                        });
-                        if (results.length >= 10) break;
-                    }
-                    return results;
-                }""", search_text)
-
-                for item in found:
-                    name = item.get("name", "").strip()
-                    if not name:
-                        continue
-                    haystack = f"{name} {item.get('context', '')}".lower()
-                    if any(term in haystack for term in PERSONA_RELEVANCE_TERMS):
-                        candidates.setdefault(name.lower(), item)
-                        if len(candidates) >= limit:
-                            break
-            except Exception as exc:
-                candidates.setdefault(f"error-{search_text}".lower(), {
-                    "name": search_text,
-                    "error": str(exc),
-                })
-
-        known = {name.lower() for name in PERSONA_SUBREDDITS}
-        lines = [
-            "Persona subreddit discovery results. Review these before adding them to the allowed warmup list:",
-            f"Persona: {WARMUP_PERSONA['name']}",
-        ]
-        for idx, item in enumerate(list(candidates.values())[:limit], start=1):
-            if item.get("error"):
-                lines.append(f"{idx}. Search '{item['name']}' failed: {item['error']}")
-                continue
-            known_note = "already allowed" if item["name"].lower() in known else "candidate"
-            lines.append(
-                f"{idx}. r/{item['name']} ({known_note})\n"
-                f"URL: {item['url']}\n"
-                f"Matched from: {item.get('query', '')}\n"
-                f"Context: {item.get('context', '')}"
-            )
-
         await lazy.persist_session()
         return "\n".join(lines)
 
@@ -937,7 +931,6 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         browse_reddit,
         warmup_reddit,
         find_warmup_comment_opportunities,
-        discover_persona_subreddits,
         search_reddit_posts,
         navigate_to_post,
         comment_on_post,

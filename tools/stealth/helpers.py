@@ -84,7 +84,7 @@ async def _random_scroll(
         scroll_amount = behavior.human_scroll_distance()
     else:
         scroll_amount = random.randint(200, 900)
-    await page.mouse.wheel(0, scroll_amount)
+    await _smooth_wheel_scroll(page, scroll_amount)
     if account_id:
         await _get_behavior_engine(account_id).delay("reading", min_s=read_min, max_s=read_max)
     else:
@@ -92,7 +92,7 @@ async def _random_scroll(
         hi = read_max if read_max is not None else 4.0
         await asyncio.sleep(random.uniform(lo, hi))
     if random.random() < 0.3:
-        await page.mouse.wheel(0, -random.randint(50, 200))
+        await _smooth_wheel_scroll(page, -random.randint(50, 200))
         if account_id:
             await _delay(account_id, context="pre_click")
         else:
@@ -159,6 +159,30 @@ def _generate_bezier_control_points(start: tuple[int, int], end: tuple[int, int]
     return cp1, cp2
 
 
+def _ease_in_out_cubic(t: float) -> float:
+    if t < 0.5:
+        return 4 * t * t * t
+    return 1 - pow(-2 * t + 2, 3) / 2
+
+
+async def _smooth_wheel_scroll(page: Page, total_delta_y: int) -> None:
+    """Scroll in eased micro-steps so visible movement is less jumpy."""
+    magnitude = abs(total_delta_y)
+    if magnitude <= 0:
+        return
+    steps = max(8, min(28, int(magnitude / 45)))
+    direction = 1 if total_delta_y > 0 else -1
+    previous = 0.0
+    for i in range(1, steps + 1):
+        eased = _ease_in_out_cubic(i / steps)
+        current = magnitude * eased
+        delta = max(1, int(current - previous)) * direction
+        previous = current
+        await page.mouse.wheel(0, delta)
+        if i < steps:
+            await asyncio.sleep(random.uniform(0.012, 0.045))
+
+
 async def _bezier_mouse_move(page: Page, target_x: int, target_y: int,
                               duration_ms: float = 300.0, curvature: float = 0.3) -> None:
     current_pos = await page.evaluate("""() => ({
@@ -169,10 +193,10 @@ async def _bezier_mouse_move(page: Page, target_x: int, target_y: int,
     end = (target_x, target_y)
     cp1, cp2 = _generate_bezier_control_points(start, end, curvature)
     distance = math.sqrt((end[0]-start[0])**2 + (end[1]-start[1])**2)
-    steps = max(10, min(30, int(distance / 20)))
+    steps = max(18, min(60, int(distance / 12)))
     step_duration = duration_ms / steps / 1000.0
     for i in range(steps + 1):
-        t = i / steps
+        t = _ease_in_out_cubic(i / steps)
         x, y = _bezier_point(t, start, cp1, cp2, end)
         await page.mouse.move(x, y)
         if i < steps:
@@ -182,18 +206,14 @@ async def _bezier_mouse_move(page: Page, target_x: int, target_y: int,
 
 async def _human_like_mouse_move(page: Page, target_x: int, target_y: int, account_id: Optional[str] = None) -> None:
     if account_id:
-        behavior = _get_behavior_engine(account_id)
         current_pos = await page.evaluate("""() => ({
             x: window.__lastMouseX || window.innerWidth / 2,
             y: window.__lastMouseY || window.innerHeight / 2
         })""")
         start_x, start_y = int(current_pos["x"]), int(current_pos["y"])
-        waypoints = behavior.human_mouse_move(start_x, start_y, target_x, target_y)
-        for x, y, delay_ms in waypoints:
-            await page.mouse.move(x, y)
-            if delay_ms > 0:
-                await asyncio.sleep(delay_ms / 1000.0)
-        await page.evaluate(f"() => {{ window.__lastMouseX = {target_x}; window.__lastMouseY = {target_y}; }}")
+        distance = math.sqrt((target_x - start_x) ** 2 + (target_y - start_y) ** 2)
+        duration_ms = max(350.0, min(1200.0, distance * random.uniform(1.4, 2.2)))
+        await _bezier_mouse_move(page, target_x, target_y, duration_ms=duration_ms, curvature=random.uniform(0.12, 0.28))
     else:
         await _bezier_mouse_move(page, target_x, target_y)
 
@@ -261,7 +281,7 @@ async def simulate_reading(page: Page, account_id: Optional[str] = None) -> None
         distance = behavior.human_scroll_distance() if behavior else random.choice([
             random.randint(100, 250), random.randint(250, 500), random.randint(500, 800),
         ])
-        await page.mouse.wheel(0, distance)
+        await _smooth_wheel_scroll(page, distance)
         if i < 2:
             if behavior:
                 await behavior.delay("reading")
@@ -274,7 +294,7 @@ async def simulate_reading(page: Page, account_id: Optional[str] = None) -> None
                 await asyncio.sleep(random.uniform(1.5, 4.0))
 
     if random.random() < 0.4:
-        await page.mouse.wheel(0, random.randint(-400, -150))
+        await _smooth_wheel_scroll(page, random.randint(-400, -150))
         if behavior:
             await behavior.delay("pre_click")
         else:
@@ -393,7 +413,7 @@ async def scroll_to_comment(page: Page, comment_id: str, timeout_s: int = 60) ->
         }}""", comment_id)
         if found:
             return True
-        await page.mouse.wheel(0, random.randint(300, 600))
+        await _smooth_wheel_scroll(page, random.randint(300, 600))
         await asyncio.sleep(0.8)
     return False
 
