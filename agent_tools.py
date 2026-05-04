@@ -12,6 +12,7 @@ from urllib.parse import quote_plus, urlparse
 from langchain_core.tools import tool
 
 from tools import login, browse, comment, upvote, comment_upvote, join_subreddit, post, reply
+from tools.browse_tool import warmup_browsing_session
 from tools.stealth.captcha import solve_login_recaptcha
 from session_store import delete_session, session_exists
 from browser_manager import LazyBrowser
@@ -54,6 +55,9 @@ def is_reddit_action_request(text: str) -> bool:
             "post",
             "join subreddit",
             "open reddit",
+            "warmup",
+            "warm up",
+            "karma",
         )
     )
 
@@ -252,10 +256,11 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         return status if ok else status
 
     @tool
-    async def browse_reddit(mode: str = "simulate_reading") -> str:
+    async def browse_reddit(mode: str = "simulate_reading", subreddit: str = "") -> str:
         """
         Simulate human browsing on Reddit to warm up the account before acting.
-        mode: 'simulate_reading' (default) | 'browse_random'
+        mode: 'simulate_reading' (default) | 'browse_random' | 'browse_subreddit' | 'find_posts'
+        subreddit: Optional subreddit name without r/ when mode='browse_subreddit'.
         Always call this after login and before commenting or upvoting.
         """
         page = await lazy.get_page()
@@ -263,10 +268,129 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             page=page,
             account_id=account_id,
             mode=mode,
+            subreddit=subreddit or None,
         )
         if result["success"]:
-            return "Browsing complete. Account warmed up."
+            return f"Browsing complete. Data: {result['data']}"
         return f"Browse failed: {result['error']}"
+
+    @tool
+    async def warmup_reddit(subreddits: str = "", duration_minutes: float = 5.0) -> str:
+        """
+        Run a browsing-only warm-up session across relevant subreddits.
+        Args:
+            subreddits: Comma-separated subreddit names without r/. If empty, uses safe general communities.
+            duration_minutes: Target warm-up time in minutes.
+        This tool only browses/reads. It does not post, comment, vote, or farm karma.
+        """
+        page = await lazy.get_page()
+        login_error = await _ensure_logged_in(page)
+        if login_error:
+            return login_error
+
+        parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
+        if not parsed:
+            parsed = [
+                "NoStupidQuestions",
+                "AskReddit",
+                "CasualConversation",
+                "explainlikeimfive",
+                "todayilearned",
+            ]
+
+        safe_duration = max(1.0, min(float(duration_minutes or 5.0), 30.0))
+        result = await warmup_browsing_session(
+            page=page,
+            account_id=account_id,
+            subreddits=parsed[:10],
+            duration_minutes=safe_duration,
+        )
+        if result["success"]:
+            await lazy.persist_session()
+            return f"Warm-up browsing complete. Data: {result['data']}"
+        return f"Warm-up browsing failed: {result['error']}"
+
+    @tool
+    async def find_warmup_comment_opportunities(subreddits: str = "", max_posts: int = 8) -> str:
+        """
+        Find active posts where a human-approved helpful comment might make sense.
+        Args:
+            subreddits: Comma-separated subreddit names without r/. If empty, uses general communities.
+            max_posts: Maximum candidate posts to return.
+        This tool does not submit comments. Use it to draft comments for user approval.
+        """
+        page = await lazy.get_page()
+        login_error = await _ensure_logged_in(page)
+        if login_error:
+            return login_error
+
+        parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
+        if not parsed:
+            parsed = ["NoStupidQuestions", "AskReddit", "CasualConversation", "explainlikeimfive"]
+
+        limit = max(1, min(int(max_posts or 8), 20))
+        per_sub_limit = max(1, (limit + len(parsed) - 1) // len(parsed))
+        candidates: list[dict] = []
+
+        for subreddit_name in parsed[:8]:
+            if len(candidates) >= limit:
+                break
+            url = f"https://www.reddit.com/r/{subreddit_name}/new/"
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+                found = await page.evaluate("""(subredditName) => {
+                    const seen = new Set();
+                    const results = [];
+                    const posts = [...document.querySelectorAll('shreddit-post, article, [data-testid="post-container"]')];
+                    for (const post of posts) {
+                        const anchor = post.querySelector('a[href*="/comments/"]');
+                        if (!anchor || !anchor.href || seen.has(anchor.href)) continue;
+                        seen.add(anchor.href);
+                        const title =
+                            post.getAttribute('post-title') ||
+                            anchor.innerText ||
+                            anchor.getAttribute('aria-label') ||
+                            '';
+                        const text = (post.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (!title.trim() && !text) continue;
+                        results.push({
+                            subreddit: subredditName,
+                            title: title.trim().slice(0, 180) || text.slice(0, 180),
+                            url: anchor.href,
+                            context: text.slice(0, 500),
+                        });
+                        if (results.length >= 6) break;
+                    }
+                    return results;
+                }""", subreddit_name)
+                candidates.extend(found[:per_sub_limit])
+            except Exception as exc:
+                candidates.append({
+                    "subreddit": subreddit_name,
+                    "error": str(exc),
+                })
+
+        candidates = candidates[:limit]
+        if not candidates:
+            return "No warm-up comment opportunities found."
+
+        lines = ["Warm-up comment opportunities. Draft comments only; do not post until the user approves:"]
+        for idx, item in enumerate(candidates, start=1):
+            if item.get("error"):
+                lines.append(f"{idx}. r/{item['subreddit']} failed: {item['error']}")
+                continue
+            lines.append(
+                f"{idx}. r/{item['subreddit']} - {item['title']}\n"
+                f"URL: {item['url']}\n"
+                f"Context: {item.get('context', '')[:300]}"
+            )
+        await lazy.persist_session()
+        return "\n".join(lines)
 
     @tool
     async def search_reddit_posts(query: str, subreddit: str = "", sort: str = "relevance") -> str:
@@ -541,6 +665,8 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         check_session,
         login_reddit,
         browse_reddit,
+        warmup_reddit,
+        find_warmup_comment_opportunities,
         search_reddit_posts,
         navigate_to_post,
         comment_on_post,
