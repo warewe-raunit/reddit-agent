@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64
 import os
 import re
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 from urllib.parse import quote_plus, urlparse
@@ -178,7 +178,7 @@ async def _detect_proxy_time_context(page) -> dict:
         local_now = datetime.now(ZoneInfo(timezone))
     except Exception:
         timezone = "UTC"
-        local_now = datetime.now(ZoneInfo("UTC"))
+        local_now = datetime.now(dt_timezone.utc)
 
     detected["timezone"] = timezone
     detected["local_now"] = local_now.isoformat(timespec="seconds")
