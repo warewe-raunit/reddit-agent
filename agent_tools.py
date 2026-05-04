@@ -21,15 +21,62 @@ from session_store import delete_session, session_exists
 from browser_manager import LazyBrowser
 
 
-BUSINESS_WARMUP_SUBREDDITS = ["SaaS", "marketing", "sales"]
+PERSONA_SUBREDDITS = [
+    "SaaS",
+    "marketing",
+    "sales",
+    "startups",
+    "Entrepreneur",
+    "smallbusiness",
+    "B2BMarketing",
+    "digital_marketing",
+    "Emailmarketing",
+    "GrowthHacking",
+    "ProductManagement",
+    "SideProject",
+    "indiehackers",
+    "webdev",
+    "devops",
+    "sysadmin",
+]
+DEFAULT_WARMUP_SUBREDDITS = ["SaaS", "marketing", "sales", "startups", "ProductManagement", "SideProject"]
+PERSONA_DISCOVERY_QUERIES = [
+    "SaaS founders",
+    "B2B sales",
+    "startup marketing",
+    "growth marketing",
+    "product management",
+    "business systems",
+    "automation tools",
+    "tech operators",
+]
+PERSONA_RELEVANCE_TERMS = {
+    "saas",
+    "software",
+    "startup",
+    "founder",
+    "entrepreneur",
+    "sales",
+    "marketing",
+    "growth",
+    "b2b",
+    "product",
+    "systems",
+    "automation",
+    "ops",
+    "devops",
+    "sysadmin",
+    "webdev",
+    "business",
+}
 WARMUP_START_LOCAL = time(9, 0)
 WARMUP_END_LOCAL = time(21, 30)
 
 WARMUP_PERSONA = {
-    "name": "Practical SaaS growth operator",
+    "name": "Tech, SaaS, sales, marketing, and systems enthusiast",
     "voice": (
-        "short, casual, founder/operator vibe; curious but not salesy; uses light Reddit phrasing "
-        "like 'imo', 'tbh', 'ngl', 'solid point', or 'been there' only when it fits"
+        "short, casual operator vibe; curious about SaaS, GTM, automation, workflows, and practical systems; "
+        "uses light Reddit phrasing like 'imo', 'tbh', 'ngl', 'solid point', or 'been there' only when it fits"
     ),
     "rules": [
         "Write 1-3 short sentences.",
@@ -65,10 +112,10 @@ def _captcha_config_for_login() -> Optional[dict]:
 
 
 def _normalize_subreddits(subreddits: str = "") -> list[str]:
-    allowed = {name.lower(): name for name in BUSINESS_WARMUP_SUBREDDITS}
+    allowed = {name.lower(): name for name in PERSONA_SUBREDDITS}
     parsed = [s.strip().strip("/").removeprefix("r/") for s in subreddits.split(",") if s.strip()]
     selected = [allowed[s.lower()] for s in parsed if s.lower() in allowed]
-    return selected or BUSINESS_WARMUP_SUBREDDITS.copy()
+    return selected or DEFAULT_WARMUP_SUBREDDITS.copy()
 
 
 def _subreddit_from_reddit_url(url: str) -> Optional[str]:
@@ -80,10 +127,13 @@ def _allowed_comment_target(post_url: str) -> tuple[bool, str]:
     subreddit = _subreddit_from_reddit_url(post_url)
     if not subreddit:
         return False, "I can only comment when the Reddit URL includes a subreddit path like /r/SaaS/."
-    allowed = {name.lower(): name for name in BUSINESS_WARMUP_SUBREDDITS}
+    allowed = {name.lower(): name for name in PERSONA_SUBREDDITS}
     if subreddit.lower() not in allowed:
-        allowed_text = ", ".join(f"r/{name}" for name in BUSINESS_WARMUP_SUBREDDITS)
-        return False, f"I am configured to comment only in {allowed_text}. This URL is for r/{subreddit}."
+        allowed_text = ", ".join(f"r/{name}" for name in DEFAULT_WARMUP_SUBREDDITS)
+        return False, (
+            f"I am configured to comment only in persona-matched tech/SaaS/sales/marketing/systems communities. "
+            f"Core examples: {allowed_text}. This URL is for r/{subreddit}."
+        )
     return True, allowed[subreddit.lower()]
 
 
@@ -167,12 +217,14 @@ def is_reddit_action_request(text: str) -> bool:
             "comment upvote",
             "post",
             "join subreddit",
+            "subreddit",
             "open reddit",
             "warmup",
             "warm up",
             "karma",
             "autonomous",
             "persona",
+            "discover",
         )
     )
 
@@ -398,7 +450,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         """
         Run a browsing-only warm-up session across business subreddits during proxy-local active hours.
         Args:
-            subreddits: Comma-separated subreddit names without r/. Only SaaS, marketing, and sales are allowed.
+            subreddits: Comma-separated subreddit names without r/. Only persona-matched tech, SaaS, sales, marketing, systems, startup, and product communities are allowed.
             duration_minutes: Target warm-up time in minutes.
             force: If true, run even outside the proxy-local warm-up window.
         This tool only browses/reads. It does not post, comment, vote, or farm karma.
@@ -440,7 +492,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         """
         Find active posts where a human-approved helpful comment might make sense.
         Args:
-            subreddits: Comma-separated subreddit names without r/. Only SaaS, marketing, and sales are allowed.
+            subreddits: Comma-separated subreddit names without r/. Only persona-matched tech, SaaS, sales, marketing, systems, startup, and product communities are allowed.
             max_posts: Maximum candidate posts to return.
         This tool does not submit comments. Use it to draft comments for user approval.
         """
@@ -516,6 +568,94 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
                 f"URL: {item['url']}\n"
                 f"Context: {item.get('context', '')[:300]}"
             )
+        await lazy.persist_session()
+        return "\n".join(lines)
+
+    @tool
+    async def discover_persona_subreddits(query: str = "", max_results: int = 12) -> str:
+        """
+        Search Reddit for additional subreddits that match the agent persona.
+        Args:
+            query: Optional search query. If empty, uses SaaS/sales/marketing/systems discovery queries.
+            max_results: Maximum candidate subreddit names to return.
+        This tool only discovers candidates. It does not join, post, comment, or vote.
+        """
+        page = await lazy.get_page()
+        login_error = await _ensure_logged_in(page)
+        if login_error:
+            return login_error
+
+        queries = [query.strip()] if query.strip() else PERSONA_DISCOVERY_QUERIES
+        limit = max(1, min(int(max_results or 12), 25))
+        candidates: dict[str, dict] = {}
+
+        for search_text in queries:
+            if len(candidates) >= limit:
+                break
+            url = f"https://www.reddit.com/search/?q={quote_plus(search_text)}&type=sr"
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1500)
+                found = await page.evaluate("""(searchText) => {
+                    const seen = new Set();
+                    const results = [];
+                    const anchors = [...document.querySelectorAll('a[href^="/r/"], a[href*="reddit.com/r/"]')];
+                    for (const anchor of anchors) {
+                        const href = anchor.href || anchor.getAttribute('href') || '';
+                        const match = href.match(/\\/r\\/([^\\/\\?#]+)/i);
+                        if (!match) continue;
+                        const name = decodeURIComponent(match[1]);
+                        if (!name || seen.has(name.toLowerCase())) continue;
+                        seen.add(name.toLowerCase());
+                        const container = anchor.closest('search-telemetry-tracker, faceplate-tracker, article, div');
+                        const text = ((container && container.innerText) || anchor.innerText || '').replace(/\\s+/g, ' ').trim();
+                        results.push({
+                            name,
+                            url: `https://www.reddit.com/r/${name}/`,
+                            context: text.slice(0, 260),
+                            query: searchText,
+                        });
+                        if (results.length >= 10) break;
+                    }
+                    return results;
+                }""", search_text)
+
+                for item in found:
+                    name = item.get("name", "").strip()
+                    if not name:
+                        continue
+                    haystack = f"{name} {item.get('context', '')}".lower()
+                    if any(term in haystack for term in PERSONA_RELEVANCE_TERMS):
+                        candidates.setdefault(name.lower(), item)
+                        if len(candidates) >= limit:
+                            break
+            except Exception as exc:
+                candidates.setdefault(f"error-{search_text}".lower(), {
+                    "name": search_text,
+                    "error": str(exc),
+                })
+
+        known = {name.lower() for name in PERSONA_SUBREDDITS}
+        lines = [
+            "Persona subreddit discovery results. Review these before adding them to the allowed warmup list:",
+            f"Persona: {WARMUP_PERSONA['name']}",
+        ]
+        for idx, item in enumerate(list(candidates.values())[:limit], start=1):
+            if item.get("error"):
+                lines.append(f"{idx}. Search '{item['name']}' failed: {item['error']}")
+                continue
+            known_note = "already allowed" if item["name"].lower() in known else "candidate"
+            lines.append(
+                f"{idx}. r/{item['name']} ({known_note})\n"
+                f"URL: {item['url']}\n"
+                f"Matched from: {item.get('query', '')}\n"
+                f"Context: {item.get('context', '')}"
+            )
+
         await lazy.persist_session()
         return "\n".join(lines)
 
@@ -797,6 +937,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         browse_reddit,
         warmup_reddit,
         find_warmup_comment_opportunities,
+        discover_persona_subreddits,
         search_reddit_posts,
         navigate_to_post,
         comment_on_post,
