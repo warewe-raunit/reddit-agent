@@ -20,6 +20,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import structlog
@@ -48,9 +49,12 @@ from tools.opportunity_discovery_tool import (
     normalize_opportunity_types,
 )
 from tools.reddit_api_client import (
+    active_session_file,
     build_async_client,
     fetch_post_detail,
+    read_session_proxy,
     search_posts,
+    session_cookie_diagnostics,
 )
 from tools.reddit_session_pool import (
     DEFAULT_GLOBAL_DETAIL_CONCURRENCY,
@@ -301,6 +305,56 @@ def build_pipeline_config_from_env(
             200,
         ),
     )
+
+
+def _load_configured_session_files(config: PipelineConfig) -> list[Path]:
+    if not (config.session_files or config.max_sessions):
+        return []
+    return load_session_pool_files(
+        session_files=list(config.session_files) if config.session_files else None,
+        max_sessions=config.max_sessions,
+    )
+
+
+def _select_search_session_file(config: PipelineConfig) -> tuple[Path, str, list[Path]]:
+    """Pick the cookie jar used for Stage 1 listing search.
+
+    Multi-session config was originally only used by Stage 3 detail fetches.
+    Stage 1 now prefers the first configured/discovered session so deployment
+    issues are visible and the listing request does not silently go anonymous.
+    """
+    pool_files = _load_configured_session_files(config)
+    if pool_files:
+        return pool_files[0], "configured_session_files", pool_files
+    return active_session_file(), "active_session_file", pool_files
+
+
+def _session_diag(path: Path) -> dict:
+    diag = session_cookie_diagnostics(path)
+    diag["proxy_configured"] = bool(read_session_proxy(path)) if path.exists() else False
+    return diag
+
+
+def _session_diagnostics(
+    config: PipelineConfig,
+    search_session_file: Path,
+    search_session_source: str,
+    pool_files: list[Path],
+) -> dict:
+    active_path = active_session_file()
+    configured_paths = [Path(entry) for entry in config.session_files]
+    return {
+        "active_session": _session_diag(active_path),
+        "search_session": {
+            **_session_diag(search_session_file),
+            "source": search_session_source,
+        },
+        "configured_session_files": [_session_diag(path) for path in configured_paths],
+        "configured_session_files_found": [str(path) for path in pool_files],
+        "max_sessions": config.max_sessions,
+        "use_proxy_env_enabled": config.use_proxy,
+        "global_proxy_configured": bool(os.getenv("PROXY_URL")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1564,13 +1618,25 @@ async def discover_opportunities_via_api(
         "rejected_candidates_total": 0,
         "rejected_candidates_truncated": 0,
     }
+    search_session_file, search_session_source, discovered_session_files = _select_search_session_file(cfg)
+    coverage["reddit_session_diagnostics"] = _session_diagnostics(
+        cfg,
+        search_session_file,
+        search_session_source,
+        discovered_session_files,
+    )
+    search_proxy_url = read_session_proxy(search_session_file) if search_session_file.exists() else None
 
     seen_keys: set[str] = set(cfg.seen_url_keys or set())
     review_fn = llm_review or (lambda c, p: _async_heuristic(c, p))
     approved: list[dict] = []
 
     # ---- Stage 1: lightweight listing fetch per opportunity type ----
-    async with build_async_client(use_proxy=cfg.use_proxy) as client:
+    async with build_async_client(
+        use_proxy=cfg.use_proxy,
+        session_file=search_session_file,
+        proxy_url=search_proxy_url,
+    ) as client:
         all_listings: list[dict] = []
         for opportunity_type in selected_types:
             if opportunity_type not in OPPORTUNITY_TYPE_CONFIG:

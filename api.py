@@ -127,7 +127,7 @@ class OpportunityFetcherTuning(BaseModel):
     )
     session_files: list[str] = Field(
         default_factory=list,
-        description="Optional saved Reddit session JSON files for parallel detail fetching.",
+        description="Optional saved Reddit session JSON files for authenticated search and parallel detail fetching.",
     )
     max_sessions: Optional[int] = Field(
         None,

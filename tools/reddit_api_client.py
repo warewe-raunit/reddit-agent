@@ -40,6 +40,11 @@ def _active_session_file(account_id: str = "") -> Path:
     return ROOT / "sessions" / f"{aid}.json"
 
 
+def active_session_file(account_id: str = "") -> Path:
+    """Return the session file the single-client search path will use by default."""
+    return _active_session_file(account_id)
+
+
 def load_reddit_cookies(session_file: Optional[Path] = None) -> httpx.Cookies:
     cookies = httpx.Cookies()
     path = session_file or _active_session_file()
@@ -59,6 +64,33 @@ def load_reddit_cookies(session_file: Optional[Path] = None) -> httpx.Cookies:
             continue
         cookies.set(name, value, domain=domain, path=str(cookie.get("path") or "/"))
     return cookies
+
+
+def reddit_cookie_names(cookies: httpx.Cookies) -> list[str]:
+    jar = getattr(cookies, "jar", None)
+    if jar is None:
+        return []
+    return sorted(
+        {
+            cookie.name
+            for cookie in jar
+            if "reddit.com" in str(getattr(cookie, "domain", "") or "")
+        }
+    )
+
+
+def session_cookie_diagnostics(session_file: Optional[Path] = None) -> dict[str, Any]:
+    """Non-sensitive diagnostics for proving whether saved Reddit auth loaded."""
+    path = session_file or _active_session_file()
+    cookies = load_reddit_cookies(path)
+    names = reddit_cookie_names(cookies)
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "cookie_count": len(cookies),
+        "has_reddit_session": "reddit_session" in names,
+        "reddit_cookie_names": names,
+    }
 
 
 def discover_session_files(
@@ -144,7 +176,7 @@ def _user_agent() -> str:
 
 
 def _headers(query: str, time_filter: str = "week") -> dict[str, str]:
-    return {
+    headers = {
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": (
@@ -153,6 +185,22 @@ def _headers(query: str, time_filter: str = "week") -> dict[str, str]:
         ),
         "User-Agent": _user_agent(),
     }
+    optional_env_headers = {
+        "sec-ch-ua": "BROWSER_SEC_CH_UA",
+        "sec-ch-ua-mobile": "BROWSER_SEC_CH_UA_MOBILE",
+        "sec-ch-ua-platform": "BROWSER_SEC_CH_UA_PLATFORM",
+    }
+    for header_name, env_name in optional_env_headers.items():
+        value = os.getenv(env_name)
+        if value:
+            headers[header_name] = value
+
+    if os.getenv("BROWSER_DEVICE_CATEGORY", "").strip().lower() == "mobile":
+        headers.setdefault("sec-ch-ua-mobile", "?1")
+        headers.setdefault("sec-fetch-dest", "empty")
+        headers.setdefault("sec-fetch-mode", "cors")
+        headers.setdefault("sec-fetch-site", "same-origin")
+    return headers
 
 
 def _post_created_utc(data: dict[str, Any]) -> Optional[float]:
@@ -436,6 +484,8 @@ def build_async_client(
         "timeout": timeout,
     }
     chosen_proxy = proxy_url
+    if chosen_proxy is None and session_file is not None:
+        chosen_proxy = read_session_proxy(session_file)
     if chosen_proxy is None and use_proxy:
         chosen_proxy = os.getenv("PROXY_URL")
     if chosen_proxy:
