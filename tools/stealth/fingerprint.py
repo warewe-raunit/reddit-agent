@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,6 +79,14 @@ _SEC_CH_UA_MAP: dict[str, str] = {
 
 _DEFAULT_SEC_CH_UA = _SEC_CH_UA_MAP["133"]
 
+_DEFAULT_MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
+_DEFAULT_MOBILE_SEC_CH_UA = (
+    '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"'
+)
+
 _COLLISION_KEYS: list[str] = [
     "webgl_renderer", "screen_resolution", "hardware_concurrency",
     "device_memory", "canvas_noise_seed",
@@ -120,6 +130,113 @@ def _pick_n_from_pool(pool: list[Any], n: int, account_id: str, salt: str) -> li
     return [pool[i] for i in indices]
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def _chrome_major_from_ua(user_agent: str, fallback: str = "120") -> str:
+    match = re.search(r"Chrome/(\d+)", user_agent)
+    return match.group(1) if match else fallback
+
+
+def _android_version_from_ua(user_agent: str, fallback: str = "13.0.0") -> str:
+    match = re.search(r"Android\s+([0-9]+(?:\.[0-9]+)*)", user_agent)
+    if not match:
+        return fallback
+    parts = match.group(1).split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return ".".join(parts[:3])
+
+
+def _apply_env_profile_overrides(profile: dict) -> dict:
+    """Apply optional .env browser profile overrides.
+
+    Set BROWSER_PROFILE_IS_ACTIVE=true or BROWSER_DEVICE_CATEGORY=mobile to
+    activate the mobile profile fields.
+    """
+    device_category = os.getenv("BROWSER_DEVICE_CATEGORY", "").strip().lower()
+    profile_active = _env_bool("BROWSER_PROFILE_IS_ACTIVE", _env_bool("BROWSER_IS_ACTIVE", False))
+    if not profile_active and device_category != "mobile":
+        return profile
+
+    user_agent = os.getenv("BROWSER_USER_AGENT", _DEFAULT_MOBILE_USER_AGENT).strip()
+    chrome_major = _chrome_major_from_ua(user_agent)
+    sec_ch_ua = os.getenv(
+        "BROWSER_SEC_CH_UA",
+        _SEC_CH_UA_MAP.get(chrome_major, _DEFAULT_MOBILE_SEC_CH_UA),
+    ).strip()
+    sec_ch_ua_mobile = os.getenv("BROWSER_SEC_CH_UA_MOBILE", "?1").strip()
+    sec_ch_ua_platform = os.getenv("BROWSER_SEC_CH_UA_PLATFORM", '"Android"').strip()
+    platform = os.getenv("BROWSER_PLATFORM", "Linux armv8l").strip()
+
+    width = _env_int("BROWSER_WIDTH", 412)
+    height = _env_int("BROWSER_HEIGHT", 915)
+    is_mobile = device_category == "mobile" or sec_ch_ua_mobile == "?1"
+
+    profile.update({
+        "screen_resolution": {"width": width, "height": height},
+        "platform": platform,
+        "device_category": device_category or ("mobile" if is_mobile else "desktop"),
+        "is_mobile": is_mobile,
+        "has_touch": _env_bool("BROWSER_HAS_TOUCH", is_mobile),
+        "max_touch_points": _env_int("BROWSER_MAX_TOUCH_POINTS", 5 if is_mobile else 0),
+        "device_scale_factor": _env_float(
+            "BROWSER_DEVICE_SCALE_FACTOR",
+            2.625 if is_mobile else float(profile.get("device_scale_factor", 1)),
+        ),
+        "user_agent": user_agent,
+        "sec_ch_ua": sec_ch_ua,
+        "sec_ch_ua_mobile": sec_ch_ua_mobile,
+        "sec_ch_ua_platform": sec_ch_ua_platform,
+        "mobile_model": os.getenv("BROWSER_MODEL", "Pixel 7").strip(),
+        "mobile_platform_version": os.getenv(
+            "BROWSER_PLATFORM_VERSION",
+            _android_version_from_ua(user_agent),
+        ).strip(),
+        "architecture": os.getenv("BROWSER_ARCHITECTURE", "arm" if is_mobile else "x86").strip(),
+        "bitness": os.getenv("BROWSER_BITNESS", "64").strip(),
+        "webgl_renderer": os.getenv(
+            "BROWSER_WEBGL_RENDERER",
+            "ANGLE (ARM, Mali-G710, OpenGL ES 3.2)",
+        ).strip(),
+        "webgl_vendor": os.getenv("BROWSER_WEBGL_VENDOR", "Google Inc. (ARM)").strip(),
+        "plugins": [] if is_mobile else profile.get("plugins", []),
+        "fonts": ["Roboto", "Noto Sans", "Arial"] if is_mobile else profile.get("fonts", []),
+        "connection": {
+            "effectiveType": os.getenv("BROWSER_EFFECTIVE_TYPE", "4g").strip(),
+            "rtt": _env_int("BROWSER_RTT", 80 if is_mobile else 50),
+            "downlink": _env_float("BROWSER_DOWNLINK", 12.0 if is_mobile else 10.0),
+            "saveData": _env_bool("BROWSER_SAVE_DATA", False),
+            "type": os.getenv("BROWSER_CONNECTION_TYPE", "cellular" if is_mobile else "wifi").strip(),
+        },
+    })
+    return profile
+
+
 @dataclass
 class BrowserProfileManager:
     """Generate, inject, and compare deterministic browser fingerprint profiles."""
@@ -143,12 +260,10 @@ class BrowserProfileManager:
         locale = _TIMEZONE_LOCALE_MAP.get(timezone, "en-US")
 
         user_agent = _pick_from_pool(_USER_AGENT_TEMPLATES, account_id, "ua")
-        import re as _re_mod
-        _chrome_ver_match = _re_mod.search(r"Chrome/(\d+)", user_agent)
-        _chrome_major = _chrome_ver_match.group(1) if _chrome_ver_match else "131"
+        _chrome_major = _chrome_major_from_ua(user_agent, fallback="131")
         sec_ch_ua = _SEC_CH_UA_MAP.get(_chrome_major, _DEFAULT_SEC_CH_UA)
 
-        return {
+        profile = {
             "account_id": account_id,
             "canvas_noise_seed": canvas_noise_seed,
             "webgl_renderer": webgl_renderer,
@@ -168,7 +283,12 @@ class BrowserProfileManager:
             "sec_ch_ua": sec_ch_ua,
             "sec_ch_ua_platform": '"Windows"',
             "sec_ch_ua_mobile": "?0",
+            "device_category": "desktop",
+            "is_mobile": False,
+            "has_touch": False,
+            "max_touch_points": 0,
         }
+        return _apply_env_profile_overrides(profile)
 
     async def inject(self, page: Page, profile: dict) -> None:
         """Inject fingerprint overrides into *page* via addInitScript.
@@ -203,6 +323,18 @@ def _build_inject_script(profile: dict) -> str:
     canvas_seed = profile["canvas_noise_seed"]
     plugins_json = json.dumps(profile["plugins"])
     timezone = profile["timezone"]
+    max_touch_points = int(profile.get("max_touch_points", 0))
+    is_mobile = bool(profile.get("is_mobile", False))
+    outer_width_delta = 0 if is_mobile else 15
+    outer_height_delta = 0 if is_mobile else 85
+    connection = profile.get("connection") or {
+        "effectiveType": "4g",
+        "rtt": 50,
+        "downlink": 10,
+        "saveData": False,
+        "type": "wifi",
+    }
+    connection_json = json.dumps(connection)
 
     return f"""
 (() => {{
@@ -340,7 +472,7 @@ def _build_inject_script(profile: dict) -> str:
     Object.defineProperty(Intl, 'DateTimeFormat', {{ value: newDTF, writable: true, configurable: true }});
 
     // --- Other navigator properties --------------------------------------------
-    Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => 0 }});
+    Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => {max_touch_points} }});
     Object.defineProperty(navigator, 'doNotTrack', {{ get: () => null }});
 
     // --- performance.memory (Chrome fingerprint check) ------------------------
@@ -368,10 +500,13 @@ def _build_inject_script(profile: dict) -> str:
     }}
 
     // --- Network Connection API ------------------------------------------------
+    const connectionData = {connection_json};
     if (!navigator.connection) {{
         Object.defineProperty(navigator, 'connection', {{
-            get: () => ({{ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false, type: 'wifi',
-                           addEventListener: function() {{}}, removeEventListener: function() {{}} }}),
+            get: () => Object.assign({{
+                addEventListener: function() {{}},
+                removeEventListener: function() {{}},
+            }}, connectionData),
         }});
     }}
 
@@ -434,7 +569,7 @@ def _build_inject_script(profile: dict) -> str:
     }}
 
     // --- window.outerWidth/outerHeight consistency ----------------------------
-    Object.defineProperty(window, 'outerWidth', {{ get: () => window.innerWidth + 15 }});
-    Object.defineProperty(window, 'outerHeight', {{ get: () => window.innerHeight + 85 }});
+    Object.defineProperty(window, 'outerWidth', {{ get: () => window.innerWidth + {outer_width_delta} }});
+    Object.defineProperty(window, 'outerHeight', {{ get: () => window.innerHeight + {outer_height_delta} }});
 }})();
 """

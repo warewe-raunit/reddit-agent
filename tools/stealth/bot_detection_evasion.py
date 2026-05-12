@@ -46,7 +46,22 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+
+def _parse_sec_ch_ua(sec_ch_ua: str, chrome_ver: str) -> list[dict[str, str]]:
+    brands = [
+        {"brand": brand, "version": version}
+        for brand, version in re.findall(r'"([^"]+)";v="([^"]+)"', sec_ch_ua or "")
+    ]
+    if brands:
+        return brands
+    return [
+        {"brand": "Not_A Brand", "version": "8"},
+        {"brand": "Chromium", "version": chrome_ver},
+        {"brand": "Google Chrome", "version": chrome_ver},
+    ]
 
 
 def build_evasion_script(profile: dict) -> str:
@@ -57,6 +72,14 @@ def build_evasion_script(profile: dict) -> str:
     platform = profile.get("platform", "Win32")
     hw_concurrency = profile.get("hardware_concurrency", 8)
     device_memory = profile.get("device_memory", 8)
+    sec_ch_ua = profile.get("sec_ch_ua", "")
+    sec_ch_ua_mobile = profile.get("sec_ch_ua_mobile", "?0")
+    sec_ch_ua_platform = str(profile.get("sec_ch_ua_platform", '"Windows"')).strip().strip('"')
+    is_mobile = bool(profile.get("is_mobile", False)) or sec_ch_ua_mobile == "?1"
+    platform_version = profile.get("mobile_platform_version", "10.0.0" if not is_mobile else "13.0.0")
+    mobile_model = profile.get("mobile_model", "Pixel 7" if is_mobile else "")
+    architecture = profile.get("architecture", "arm" if is_mobile else "x86")
+    bitness = profile.get("bitness", "64")
 
     # Derive Sec-CH-UA from UA string
     chrome_ver = "120"
@@ -67,6 +90,7 @@ def build_evasion_script(profile: dict) -> str:
             chrome_ver = m.group(1)
     except Exception:
         pass
+    ch_brands = _parse_sec_ch_ua(sec_ch_ua, chrome_ver)
 
     return f"""
 (() => {{
@@ -81,6 +105,13 @@ const _UA = {json.dumps(user_agent)};
 const _LOCALE = {json.dumps(locale)};
 const _PLATFORM = {json.dumps(platform)};
 const _CHROME_VER = {json.dumps(chrome_ver)};
+const _CH_BRANDS = {json.dumps(ch_brands)};
+const _CH_MOBILE = {json.dumps(is_mobile)};
+const _CH_PLATFORM = {json.dumps(sec_ch_ua_platform)};
+const _CH_PLATFORM_VERSION = {json.dumps(platform_version)};
+const _CH_MODEL = {json.dumps(mobile_model)};
+const _CH_ARCHITECTURE = {json.dumps(architecture)};
+const _CH_BITNESS = {json.dumps(bitness)};
 
 // ── CATEGORY A: Automation Artifact Removal ──────────────────────────────
 
@@ -223,57 +254,37 @@ if (window.PerformanceTiming) {{
 // ── CATEGORY D: Client Hints (Sec-CH-UA) Consistency ────────────────────
 
 // D1. navigator.userAgentData — Chrome 90+ Client Hints API
-// Anti-bot systems cross-reference UA string with userAgentData.
-// If they don't match, it's a bot signal. Headless sometimes lacks this.
-if (!navigator.userAgentData) {{
-    try {{
-        const brands = [
-            {{ brand: 'Not_A Brand', version: '8' }},
-            {{ brand: 'Chromium', version: _CHROME_VER }},
-            {{ brand: 'Google Chrome', version: _CHROME_VER }},
-        ];
-        const uaData = {{
-            brands: brands,
-            mobile: false,
-            platform: _PLATFORM === 'Win32' ? 'Windows' : _PLATFORM,
-            getHighEntropyValues: async function(hints) {{
-                const result = {{}};
-                const ua_parts = {{
-                    architecture: 'x86',
-                    bitness: '64',
-                    brands: brands,
-                    fullVersionList: brands.map(b => ({{ brand: b.brand, version: b.version + '.0.0.0' }})),
-                    mobile: false,
-                    model: '',
-                    platform: _PLATFORM === 'Win32' ? 'Windows' : _PLATFORM,
-                    platformVersion: '10.0.0',
-                    uaFullVersion: _CHROME_VER + '.0.0.0',
-                    wow64: false,
-                }};
-                (hints || []).forEach(h => {{ if (h in ua_parts) result[h] = ua_parts[h]; }});
-                return Promise.resolve(result);
-            }},
-            toJSON: function() {{ return {{ brands, mobile: false, platform: 'Windows' }}; }},
-        }};
-        Object.defineProperty(navigator, 'userAgentData', {{
-            get: () => uaData,
-            configurable: true,
-        }});
-    }} catch(_) {{}}
-}} else {{
-    // Patch existing userAgentData to match profile
-    try {{
-        const _origGetHighEntropy = navigator.userAgentData.getHighEntropyValues.bind(navigator.userAgentData);
-        navigator.userAgentData.getHighEntropyValues = async function(hints) {{
-            const result = await _origGetHighEntropy(hints);
-            // Normalize platform version to not expose headless artifacts
-            if (result.platformVersion === '' || result.platformVersion === '0.0.0') {{
-                result.platformVersion = '10.0.0';
-            }}
-            return result;
-        }};
-    }} catch(_) {{}}
-}}
+// Keep Client Hints aligned with the configured browser profile.
+try {{
+    const brands = _CH_BRANDS;
+    const uaData = {{
+        brands: brands,
+        mobile: _CH_MOBILE,
+        platform: _CH_PLATFORM,
+        getHighEntropyValues: async function(hints) {{
+            const result = {{}};
+            const ua_parts = {{
+                architecture: _CH_ARCHITECTURE,
+                bitness: _CH_BITNESS,
+                brands: brands,
+                fullVersionList: brands.map(b => ({{ brand: b.brand, version: b.version + '.0.0.0' }})),
+                mobile: _CH_MOBILE,
+                model: _CH_MODEL,
+                platform: _CH_PLATFORM,
+                platformVersion: _CH_PLATFORM_VERSION,
+                uaFullVersion: _CHROME_VER + '.0.0.0',
+                wow64: false,
+            }};
+            (hints || []).forEach(h => {{ if (h in ua_parts) result[h] = ua_parts[h]; }});
+            return Promise.resolve(result);
+        }},
+        toJSON: function() {{ return {{ brands, mobile: _CH_MOBILE, platform: _CH_PLATFORM }}; }},
+    }};
+    Object.defineProperty(navigator, 'userAgentData', {{
+        get: () => uaData,
+        configurable: true,
+    }});
+}} catch(_) {{}}
 
 // ── CATEGORY E: Prototype Chain Hardening ────────────────────────────────
 

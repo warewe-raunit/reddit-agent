@@ -17,14 +17,31 @@ BrowserProfileManager.generate(account_id) — deterministic per account.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
-from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 
+from proxy_config import playwright_proxy_config
 from session_store import load_session, save_session
 from tools.stealth.fingerprint import BrowserProfileManager
 from tools.stealth.bot_detection_evasion import BotDetectionEvasionManager
+
+
+def profile_session_id(account_id: str, profile: dict) -> str:
+    """Return the storage-state key for this account/profile pairing."""
+    category = str(profile.get("device_category") or "desktop").strip().lower()
+    is_mobile = bool(profile.get("is_mobile", False))
+    if category == "desktop" and not is_mobile:
+        return account_id
+    safe_category = re.sub(r"[^A-Za-z0-9_.-]+", "_", category).strip("_") or "profile"
+    return f"{account_id}__{safe_category}"
+
+
+def active_profile_session_id(account_id: str) -> str:
+    """Return the storage-state key for the currently configured profile."""
+    profile = BrowserProfileManager().generate(account_id)
+    return profile_session_id(account_id, profile)
 
 
 async def launch_browser(
@@ -37,6 +54,7 @@ async def launch_browser(
     profile_mgr = BrowserProfileManager()
     profile = profile_mgr.generate(account_id)
     screen = profile["screen_resolution"]
+    session_id = profile_session_id(account_id, profile)
 
     launch_args: dict = {
         "headless": headless,
@@ -47,24 +65,22 @@ async def launch_browser(
             f"--window-size={screen['width']},{screen['height']}",
         ],
     }
-    if proxy_url:
-        parsed = urlparse(proxy_url)
-        proxy_config: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-        if parsed.username:
-            proxy_config["username"] = parsed.username
-        if parsed.password:
-            proxy_config["password"] = parsed.password
+    proxy_config = playwright_proxy_config(proxy_url)
+    if proxy_config:
         launch_args["proxy"] = proxy_config
 
     browser = await pw.chromium.launch(**launch_args)
-    saved_session = load_session(account_id)
+    saved_session = load_session(session_id)
 
     context_args: dict = {
         "viewport": {"width": screen["width"], "height": screen["height"]},
+        "screen": {"width": screen["width"], "height": screen["height"]},
         "user_agent": profile["user_agent"],
         "locale": profile["locale"],
         "timezone_id": profile["timezone"],
         "device_scale_factor": profile["device_scale_factor"],
+        "is_mobile": bool(profile.get("is_mobile", False)),
+        "has_touch": bool(profile.get("has_touch", False)),
         "extra_http_headers": {
             "sec-ch-ua": profile["sec_ch_ua"],
             "sec-ch-ua-mobile": profile["sec_ch_ua_mobile"],
@@ -95,8 +111,10 @@ async def launch_browser(
 
 
 async def persist_session(account_id: str, context: BrowserContext) -> None:
+    profile = BrowserProfileManager().generate(account_id)
+    session_id = profile_session_id(account_id, profile)
     state = await context.storage_state()
-    save_session(account_id, state)
+    save_session(session_id, state)
 
 
 async def close_browser(pw: Playwright, browser: Browser) -> None:

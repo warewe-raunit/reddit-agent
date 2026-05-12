@@ -165,22 +165,251 @@ def _ease_in_out_cubic(t: float) -> float:
     return 1 - pow(-2 * t + 2, 3) / 2
 
 
-async def _smooth_wheel_scroll(page: Page, total_delta_y: int) -> None:
-    """Scroll in eased micro-steps so visible movement is less jumpy."""
+async def _page_has_touch(page: Page) -> bool:
+    """Cache-detect touch capability for current page."""
+    cached = getattr(page, "_has_touch_cached", None)
+    if cached is not None:
+        return bool(cached)
+    try:
+        result = await page.evaluate(
+            "() => ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 0"
+        )
+        has_touch = bool(result)
+    except Exception:
+        has_touch = False
+    try:
+        setattr(page, "_has_touch_cached", has_touch)
+    except Exception:
+        pass
+    return has_touch
+
+
+async def _curved_touch_scroll(page: Page, total_delta_y: int, *, curvature: float = 0.22) -> None:
+    """Simulate curved finger-swipe scroll via CDP touch events.
+
+    Path is mostly vertical but follows a bezier arc with sideways drift —
+    mimics natural thumb-swipe gesture on mobile rather than perfectly straight drag.
+    Breaks long scrolls into multiple swipes with brief pauses (re-grip).
+    """
     magnitude = abs(total_delta_y)
     if magnitude <= 0:
         return
-    steps = max(8, min(28, int(magnitude / 45)))
+
+    try:
+        viewport = await page.evaluate(
+            "() => ({ w: window.innerWidth, h: window.innerHeight })"
+        )
+        vw = int(viewport.get("w") or 0)
+        vh = int(viewport.get("h") or 0)
+    except Exception:
+        vw, vh = 390, 844
+
+    if vw <= 0 or vh <= 0:
+        vw, vh = 390, 844
+
+    # Cap each swipe to a thumb-reachable arc, with a different envelope per call.
+    max_swipe = max(80, int(vh * random.uniform(0.46, 0.68)))
+    min_leg = random.randint(28, 58)
+    gesture_curvature = max(0.06, min(0.55, curvature * random.uniform(0.55, 1.85)))
+    direction = 1 if total_delta_y > 0 else -1  # +ve = scroll down (finger moves up)
+    remaining = magnitude
+
+    try:
+        initial_scroll_y = float(await page.evaluate("() => window.scrollY"))
+    except Exception:
+        initial_scroll_y = None
+
+    try:
+        cdp = await page.context.new_cdp_session(page)
+    except Exception:
+        # CDP unavailable — fall back to wheel
+        await _wheel_scroll_fallback(page, total_delta_y)
+        return
+
+    try:
+        while remaining > 0:
+            before_leg_remaining = remaining
+            leg = min(max_swipe, remaining) if remaining > max_swipe else remaining
+            # Split some medium swipes and jitter long swipes so they do not stack perfectly.
+            if remaining > max_swipe:
+                leg = int(leg * random.uniform(0.74, 1.0))
+            elif before_leg_remaining > min_leg * 2 and random.random() < 0.28:
+                leg = int(before_leg_remaining * random.uniform(0.55, 0.86))
+            if before_leg_remaining >= min_leg:
+                leg = max(min_leg, leg)
+            leg = int(min(before_leg_remaining, leg))
+            remaining = max(0, remaining - leg)
+
+            # Pick natural finger start zone based on direction
+            x_center = vw * random.uniform(0.34, 0.66)
+            x_band = vw * random.uniform(0.045, 0.145)
+            start_x = random.randint(
+                max(2, int(x_center - x_band)),
+                min(vw - 2, int(x_center + x_band)),
+            )
+            if direction > 0:
+                start_y = random.randint(
+                    int(vh * random.uniform(0.52, 0.60)),
+                    int(vh * random.uniform(0.72, 0.84)),
+                )
+            else:
+                start_y = random.randint(
+                    int(vh * random.uniform(0.16, 0.28)),
+                    int(vh * random.uniform(0.38, 0.50)),
+                )
+            end_x = start_x + int(random.triangular(-vw * 0.14, vw * 0.14, 0))
+            end_x = max(2, min(vw - 2, end_x))
+            end_y = start_y - direction * leg
+            end_y = max(2, min(vh - 2, end_y))
+
+            # Bezier control points push the arc sideways for thumb-curve feel
+            arc_mag = int(leg * gesture_curvature * random.uniform(0.55, 1.55))
+            if random.random() < 0.5:
+                arc_mag = -arc_mag
+            cp1_frac = random.uniform(0.22, 0.42)
+            cp2_frac = random.uniform(0.58, 0.82)
+            cp1 = (
+                start_x + (end_x - start_x) * cp1_frac + arc_mag,
+                start_y + (end_y - start_y) * cp1_frac,
+            )
+            cp2 = (
+                start_x + (end_x - start_x) * cp2_frac - int(arc_mag * random.uniform(0.35, 0.75)),
+                start_y + (end_y - start_y) * cp2_frac,
+            )
+
+            min_steps = random.randint(12, 18)
+            max_steps = random.randint(34, 48)
+            steps = max(min_steps, min(max_steps, int(leg / random.uniform(10.5, 20.0)) + random.randint(-2, 4)))
+            touch_id = random.randint(1, 999_999)
+            radius_x = random.uniform(4.0, 8.6)
+            radius_y = max(3.5, radius_x * random.uniform(0.85, 1.18))
+            force = random.uniform(0.38, 0.76)
+
+            def touch_point(x: int, y: int) -> dict:
+                return {
+                    "x": max(1, min(vw - 2, int(x))),
+                    "y": max(1, min(vh - 2, int(y))),
+                    "id": touch_id,
+                    "radiusX": max(2.5, radius_x + random.uniform(-0.35, 0.35)),
+                    "radiusY": max(2.5, radius_y + random.uniform(-0.35, 0.35)),
+                    "force": max(0.25, min(0.9, force + random.uniform(-0.06, 0.06))),
+                }
+
+            try:
+                await cdp.send(
+                    "Input.dispatchTouchEvent",
+                    {"type": "touchStart", "touchPoints": [touch_point(start_x, start_y)]},
+                )
+            except Exception:
+                # If touchStart fails (e.g. context not touch-enabled), fall back
+                await _wheel_scroll_fallback(page, direction * (leg + remaining))
+                return
+
+            # Brief settle so initial touch registers before motion
+            await asyncio.sleep(random.uniform(0.012, 0.055))
+
+            previous_pt = (start_x, start_y)
+            delay_floor = random.uniform(0.004, 0.010)
+            delay_ceiling = random.uniform(0.014, 0.030)
+            for i in range(1, steps + 1):
+                t = _ease_in_out_cubic(i / steps)
+                x, y = _bezier_point(t, (start_x, start_y), cp1, cp2, (end_x, end_y))
+                # Tiny per-step jitter to roughen the path
+                jitter = 2 if random.random() < 0.22 else 1
+                x += random.randint(-jitter, jitter)
+                y += random.randint(-jitter, jitter)
+                # Avoid duplicate points (zero-motion frames look robotic)
+                if (x, y) == previous_pt:
+                    continue
+                previous_pt = (x, y)
+                try:
+                    await cdp.send(
+                        "Input.dispatchTouchEvent",
+                        {"type": "touchMove", "touchPoints": [touch_point(x, y)]},
+                    )
+                except Exception:
+                    await _wheel_scroll_fallback(page, direction * (leg + remaining))
+                    return
+                if i < steps:
+                    # Faster mid-swipe, slower at start/end (matches eased velocity feel)
+                    delay = random.uniform(delay_floor, delay_ceiling)
+                    if i < 3 or i > steps - 3:
+                        delay += random.uniform(0.006, 0.026)
+                    if 4 < i < steps - 4 and random.random() < 0.055:
+                        delay += random.uniform(0.018, 0.070)
+                    await asyncio.sleep(delay)
+
+            # Finger lift (small hold lets fling momentum register naturally)
+            await asyncio.sleep(random.uniform(0.02, 0.09))
+            try:
+                await cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+            except Exception:
+                pass
+
+            if remaining > 0:
+                try:
+                    leg_scroll_y = float(await page.evaluate("() => window.scrollY"))
+                    if initial_scroll_y is not None:
+                        moved = leg_scroll_y - initial_scroll_y
+                        if abs(moved) < 2 or moved * direction < -1:
+                            await _wheel_scroll_fallback(page, direction * (leg + remaining))
+                            return
+                except Exception:
+                    pass
+                # Re-grip pause between swipes
+                await asyncio.sleep(random.uniform(0.14, 0.68))
+    finally:
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+
+    try:
+        final_scroll_y = float(await page.evaluate("() => window.scrollY"))
+        if initial_scroll_y is not None:
+            moved = final_scroll_y - initial_scroll_y
+            if abs(moved) < 2 or moved * direction < -1:
+                await _wheel_scroll_fallback(page, total_delta_y)
+    except Exception:
+        pass
+
+
+async def _wheel_scroll_fallback(page: Page, total_delta_y: int) -> None:
+    """Vertical eased wheel scroll — used when touch path unavailable."""
+    magnitude = abs(total_delta_y)
+    if magnitude <= 0:
+        return
+    min_steps = random.randint(7, 10)
+    max_steps = random.randint(22, 34)
+    steps = max(min_steps, min(max_steps, int(magnitude / random.uniform(34, 66)) + random.randint(0, 5)))
     direction = 1 if total_delta_y > 0 else -1
     previous = 0.0
     for i in range(1, steps + 1):
         eased = _ease_in_out_cubic(i / steps)
         current = magnitude * eased
-        delta = max(1, int(current - previous)) * direction
+        delta = max(1, int((current - previous) * random.uniform(0.72, 1.28))) * direction
         previous = current
-        await page.mouse.wheel(0, delta)
+        try:
+            await page.mouse.wheel(0, delta)
+        except Exception:
+            return
         if i < steps:
-            await asyncio.sleep(random.uniform(0.012, 0.045))
+            delay = random.uniform(0.010, 0.055)
+            if 2 < i < steps - 2 and random.random() < 0.08:
+                delay += random.uniform(0.035, 0.120)
+            await asyncio.sleep(delay)
+
+
+async def _smooth_wheel_scroll(page: Page, total_delta_y: int) -> None:
+    """Scroll the page using the best available human-like gesture.
+
+    On touch-enabled contexts (mobile profiles), uses curved finger-swipe via CDP.
+    On desktop, falls back to eased wheel scroll.
+    """
+    if await _page_has_touch(page):
+        await _curved_touch_scroll(page, total_delta_y)
+        return
+    await _wheel_scroll_fallback(page, total_delta_y)
 
 
 async def _bezier_mouse_move(page: Page, target_x: int, target_y: int,

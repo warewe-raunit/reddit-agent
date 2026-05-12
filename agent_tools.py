@@ -11,14 +11,24 @@ import re
 from datetime import datetime, time, timedelta, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 from langchain_core.tools import tool
+
+import json
 
 from tools import login, browse, comment, upvote, comment_upvote, join_subreddit, post, reply
 from tools.browse_tool import warmup_browsing_session
+from tools.observation_tool import observe_page as _observe_page, summarize_observation
+from tools.opportunity_pipeline import (
+    build_default_llm_review as _build_default_llm_review,
+    discover_opportunities_via_api as _discover_opportunities_via_api,
+)
 from tools.stealth.captcha import solve_login_recaptcha
+from reddit_action_messages import post_upvote_result_message
+from reddit_login_state import reddit_login_state
+from proxy_config import captcha_proxy_config
 from session_store import delete_session, session_exists
-from browser_manager import LazyBrowser
+from browser_manager import LazyBrowser, active_profile_session_id
 
 
 PERSONA_SUBREDDITS = [
@@ -95,15 +105,7 @@ WARMUP_PERSONA = {
 
 
 def _proxy_config(proxy_url: Optional[str]) -> Optional[dict]:
-    if not proxy_url:
-        return None
-    parsed = urlparse(proxy_url)
-    config: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        config["username"] = parsed.username
-    if parsed.password:
-        config["password"] = parsed.password
-    return config
+    return captcha_proxy_config(proxy_url)
 
 
 def _captcha_config_for_login() -> Optional[dict]:
@@ -270,6 +272,8 @@ async def _discover_persona_subreddit_candidates(page, max_results: int = 8, que
 
 def is_reddit_action_request(text: str) -> bool:
     lowered = text.lower()
+    if is_opportunity_discovery_request(text):
+        return True
     return any(
         phrase in lowered
         for phrase in (
@@ -288,63 +292,39 @@ def is_reddit_action_request(text: str) -> bool:
             "karma",
             "autonomous",
             "persona",
-            "discover",
         )
     )
 
 
-async def is_reddit_logged_in(page, navigate: bool = True) -> bool:
+def is_opportunity_discovery_request(text: str) -> bool:
+    """Detect requests to find Reddit promotion opportunities for a SaaS product."""
+    lowered = text.lower()
+    patterns = (
+        r"\bfind\b.*\breddit\b.*\b(leads?|place|opportunit|link|post|comment|where)\b",
+        r"\bwhere\b.*\bpromote\b",
+        r"\breddit\b.*\bopportunit",
+        r"\bfind\b.*\bopportunit\w*\b.*\b(reddit|promot\w*|saas|product|startup)\b",
+        r"\bpromot\w+\b.*\breddit\b",
+        r"\breddit\b.*\bpromot",
+        r"\bfind\b.*\b(100|50|200|\d+)\b.*\breddit\b",
+        r"\breddit\b.*\bsaas\b.*\bpromot",
+        r"\bsaas\b.*\bpromot\w+\b.*\breddit\b",
+        r"\bwhere can i (mention|post|comment|promote)\b",
+        r"\bfind posts?\b.*\bfor my\b",
+        r"\breddit leads?\b",
+    )
+    return any(re.search(p, lowered) for p in patterns)
+
+
+async def is_reddit_logged_in(page, navigate: bool = True, expected_username: str = "") -> bool:
     """Detect whether the current Reddit browser context is logged in."""
     try:
-        if navigate:
-            await page.goto("https://www.reddit.com", wait_until="domcontentloaded", timeout=30_000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8_000)
-            except Exception:
-                pass
-
-        ui_state = await page.evaluate("""() => {
-            const visibleText = (el) => {
-                const rect = el.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0 ? (el.textContent || '').trim() : '';
-            };
-            const buttonsAndLinks = [...document.querySelectorAll('button, a')].map(visibleText).filter(Boolean);
-            const hasVisibleLogin = buttonsAndLinks.some(t => /^log in$/i.test(t));
-            const hasVisibleSignup = buttonsAndLinks.some(t => /^sign up$/i.test(t));
-            if (hasVisibleLogin || hasVisibleSignup) {
-                return { loggedIn: false, loggedOut: true, reason: 'visible_login_button' };
-            }
-
-            const loggedInSelectors = [
-                'a[href^="/user/"][data-testid="user-link"]',
-                'a[href^="/user/"]',
-                'faceplate-tracker[source="profile"] a',
-                '#expand-user-drawer-button',
-                'button[id*="USER_DROPDOWN"]',
-                'header shreddit-header-action-item a[href^="/user/"]',
-                'a[href="/submit"]',
-                'a[href="/settings/account"]',
-                'button[aria-label*="profile" i]',
-                'button[aria-label*="avatar" i]',
-            ];
-            if (loggedInSelectors.some(sel => !!document.querySelector(sel))) {
-                return { loggedIn: true, loggedOut: false, reason: 'logged_in_selector' };
-            }
-
-            const text = document.body?.innerText || '';
-            const hasLoggedInUi = /\\bCreate\\b/.test(text) && /\\bHome\\b/.test(text);
-            const hasLoggedOutUi = /\\bLog In\\b/.test(text) || /\\bSign Up\\b/.test(text);
-            return { loggedIn: hasLoggedInUi && !hasLoggedOutUi, loggedOut: hasLoggedOutUi, reason: 'text_heuristic' };
-        }""")
-
-        if ui_state.get("loggedOut"):
-            return False
-        if ui_state.get("loggedIn"):
-            return True
-
-        cookies = await page.context.cookies(["https://www.reddit.com"])
-        cookie_names = {cookie.get("name") for cookie in cookies}
-        return "reddit_session" in cookie_names and "loid" not in cookie_names
+        state = await reddit_login_state(
+            page,
+            expected_username=expected_username,
+            navigate=navigate,
+        )
+        return bool(state.get("logged_in"))
     except Exception:
         return False
 
@@ -358,7 +338,9 @@ async def ensure_reddit_logged_in(
 ) -> tuple[bool, str]:
     """Ensure Reddit is open and logged in, returning a user-facing status."""
     page = await lazy.get_page()
-    if await is_reddit_logged_in(page):
+    session_id = active_profile_session_id(account_id)
+
+    if await is_reddit_logged_in(page, expected_username=username):
         await lazy.persist_session()
         return True, "Already logged in to Reddit."
 
@@ -371,11 +353,23 @@ async def ensure_reddit_logged_in(
         proxy_config=_proxy_config(proxy_url),
     )
 
-    if result["success"] or await is_reddit_logged_in(page):
+    verified_after_login = await is_reddit_logged_in(
+        page,
+        navigate=not result["success"],
+        expected_username=username,
+    )
+    if result["success"] and verified_after_login:
         await lazy.persist_session()
         return True, "Logged in to Reddit and saved the session."
 
-    return False, f"Login failed: {result['error']}"
+    if verified_after_login:
+        await lazy.persist_session()
+        return True, "Logged in to Reddit and saved the session."
+
+    delete_session(session_id)
+    if result["success"]:
+        return False, "Login submitted, but Reddit session could not be verified. Please try login_reddit again."
+    return False, f"Login failed: {result['error'] or 'Reddit session not verified'}"
 
 
 async def open_reddit_home(
@@ -455,31 +449,116 @@ async def upvote_reddit_comment(
     return f"Comment upvote failed: {result['error']}"
 
 
-def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str, proxy_url: Optional[str] = None):
+async def upvote_reddit_post(
+    lazy: LazyBrowser,
+    account_id: str,
+    username: str,
+    password: str,
+    post_url: str,
+    proxy_url: Optional[str] = None,
+) -> str:
+    """Systematic post-upvote workflow: open/login, upvote visible UI, save."""
+    ok, status = await ensure_reddit_logged_in(lazy, account_id, username, password, proxy_url)
+    if not ok:
+        return status
+
+    page = await lazy.get_page()
+    result = await upvote(
+        page=page,
+        account_id=account_id,
+        post_url=post_url,
+    )
+    if result["success"]:
+        await lazy.persist_session()
+        return post_upvote_result_message(result["data"])
+    return f"Post upvote failed: {result['error']}"
+
+
+def make_tools(
+    lazy: LazyBrowser,
+    account_id: str,
+    username: str,
+    password: str,
+    proxy_url: Optional[str] = None,
+    confirmation_state: Optional[dict] = None,
+):
     """Return list of LangGraph tools. Browser launches on first tool call."""
+    confirmation_state = confirmation_state if confirmation_state is not None else {
+        "pending": None,
+        "approved": False,
+    }
 
     async def _is_logged_in(page) -> bool:
-        return await is_reddit_logged_in(page)
+        return await is_reddit_logged_in(page, expected_username=username)
 
     async def _ensure_logged_in(page) -> Optional[str]:
         ok, status = await ensure_reddit_logged_in(lazy, account_id, username, password, proxy_url)
         if ok:
             return None
-        delete_session(account_id)
+        delete_session(active_profile_session_id(account_id))
         return status
+
+    def _confirmation_tool_hint(action: str, details: str = "") -> Optional[str]:
+        text = f"{action} {details}".lower()
+        has_upvote = "upvote" in text or "up vote" in text
+        has_comment = "comment" in text
+        has_post = "post" in text or "thread" in text
+        if has_upvote and has_comment:
+            return "upvote_comment"
+        if has_upvote and has_post:
+            return "upvote_post"
+        if "reply" in text:
+            return "reply_to_reddit_comment"
+        if "join" in text and "subreddit" in text:
+            return "join_subreddit_tool"
+        if ("submit" in text or "create" in text or "text post" in text) and has_post:
+            return "submit_text_post"
+        if has_comment:
+            return "comment_on_post"
+        return None
+
+    def _confirmation_gate(tool_name: str) -> Optional[str]:
+        pending = confirmation_state.get("pending")
+        if not pending:
+            return None
+        if confirmation_state.get("approved"):
+            expected_tool = pending.get("tool_name")
+            if expected_tool and expected_tool != tool_name:
+                confirmation_state["approved"] = False
+                return (
+                    "[CONFIRMATION REQUIRED] The current approval is for a different action, "
+                    "so I did not run this tool.\n"
+                    f"Approved action: {pending.get('action', 'unknown')}\n"
+                    f"Approved tool: {expected_tool}\n"
+                    f"Attempted tool: {tool_name}\n"
+                    "STOP: ask the user to confirm the exact action again before calling "
+                    "another state-changing tool."
+                )
+            confirmation_state["pending"] = None
+            confirmation_state["approved"] = False
+            return None
+        return (
+            "[CONFIRMATION REQUIRED] A pending state-changing action must be confirmed "
+            f"before `{tool_name}` can run.\n"
+            f"Pending action: {pending.get('action', 'unknown')}\n"
+            f"Details: {pending.get('details', '')}\n"
+            "STOP: do not call another state-changing tool in this turn. "
+            "Ask the user to reply 'yes' to proceed or 'no' to cancel."
+        )
 
     @tool
     async def check_session() -> str:
         """Check whether a saved login session exists and is still active on Reddit."""
         page = await lazy.get_page()
+        session_id = active_profile_session_id(account_id)
         try:
             logged_in = await _is_logged_in(page)
             if logged_in:
                 await lazy.persist_session()
                 return "Session exists: True. Already logged in on Reddit. No login needed."
-            if not session_exists(account_id):
+            if not session_exists(session_id):
                 return "Session exists: False. Must call login_reddit first."
-            delete_session(account_id)
+            delete_session(session_id)
             return "Session exists: False. Session expired. Must call login_reddit."
         except Exception as e:
             return f"Session check failed: {e}. Call login_reddit to be safe."
@@ -732,6 +811,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             post_url: Full Reddit post URL.
             text: The comment text to post.
         """
+        blocked = _confirmation_gate("comment_on_post")
+        if blocked:
+            return blocked
         return await comment_on_reddit_post(
             lazy=lazy,
             account_id=account_id,
@@ -751,6 +833,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             title: Post title.
             body: Post body text.
         """
+        blocked = _confirmation_gate("submit_text_post")
+        if blocked:
+            return blocked
         page = await lazy.get_page()
         login_error = await _ensure_logged_in(page)
         if login_error:
@@ -776,6 +861,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             post_url: Full Reddit post URL containing the comment.
             text: Reply text.
         """
+        blocked = _confirmation_gate("reply_to_reddit_comment")
+        if blocked:
+            return blocked
         page = await lazy.get_page()
         login_error = await _ensure_logged_in(page)
         if login_error:
@@ -802,6 +890,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         Args:
             post_url: Full Reddit post URL.
         """
+        blocked = _confirmation_gate("upvote_post")
+        if blocked:
+            return blocked
         page = await lazy.get_page()
         login_error = await _ensure_logged_in(page)
         if login_error:
@@ -825,6 +916,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             comment_fullname: Optional Reddit comment fullname, e.g. t1_abc123.
             post_url: Optional containing post URL if comment_fullname is supplied.
         """
+        blocked = _confirmation_gate("upvote_comment")
+        if blocked:
+            return blocked
         page = await lazy.get_page()
         login_error = await _ensure_logged_in(page)
         if login_error:
@@ -848,6 +942,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         Args:
             subreddit: Subreddit name without r/ prefix (e.g. 'python').
         """
+        blocked = _confirmation_gate("join_subreddit_tool")
+        if blocked:
+            return blocked
         page = await lazy.get_page()
         login_error = await _ensure_logged_in(page)
         if login_error:
@@ -864,11 +961,59 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         return f"Join failed: {result['error']}"
 
     @tool
+    async def observe_current_page(include_screenshot: bool = False) -> str:
+        """
+        PRIMARY observation tool. Use this before clicking, submitting, or voting to
+        ground decisions in real visible UI state, and again afterward to verify the result.
+        Returns: URL, title, visible text, interactive elements (role/name/bbox/state/selector),
+        detected overlays (modal/login_wall/captcha/error/rate_limit), and optional screenshot.
+        Prefer this over get_accessibility_snapshot / get_page_text / take_screenshot for
+        most tasks — those tools remain available for targeted follow-up queries.
+        Args:
+            include_screenshot: Set True only when a visual check is needed (e.g. CAPTCHA).
+        """
+        page = await lazy.get_page()
+        try:
+            obs = await _observe_page(page, include_screenshot=include_screenshot)
+            summary = summarize_observation(obs, include_elements=True)
+            if obs.get("screenshot_b64"):
+                summary += f"\n[screenshot_b64 length={len(obs['screenshot_b64'])}]"
+            return summary
+        except Exception as e:
+            return f"observe_page failed: {e}"
+
+    @tool
+    async def request_confirmation(action: str, details: str) -> str:
+        """
+        Return a confirmation question to the user before executing a state-changing action.
+        Use when the action is ambiguous or the request was indirect (e.g. searching then acting).
+        Do NOT use when: user gave a precise direct request like "upvote this exact URL" and
+        the page observation matches unambiguously.
+        Args:
+            action: The action about to be performed (e.g. "upvote comment", "submit comment").
+            details: What was found and what will happen (e.g. "Found upvote button for comment
+                     t1_abc123, currently not upvoted, belongs to target post.").
+        Returns a confirmation message for the user to answer yes/no.
+        """
+        confirmation_state["pending"] = {
+            "action": action,
+            "details": details,
+            "tool_name": _confirmation_tool_hint(action, details),
+        }
+        confirmation_state["approved"] = False
+        return (
+            f"[CONFIRMATION REQUIRED] {details}\n"
+            f"Ready to: {action}\n"
+            "Reply 'yes' to proceed or 'no' to cancel."
+        )
+
+    @tool
     async def get_accessibility_snapshot() -> str:
         """
-        Return the accessibility tree of the current page as text.
-        Use this to read page content, find buttons, inputs, and links without screenshots.
-        Prefer this over take_screenshot for understanding page structure.
+        Return the raw Playwright accessibility tree of the current page.
+        Useful for targeted inspection of specific interactive controls.
+        For a full structured snapshot including interactive elements and overlays,
+        prefer observe_current_page instead.
         """
         page = await lazy.get_page()
         try:
@@ -882,8 +1027,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
     @tool
     async def get_page_text() -> str:
         """
-        Return all visible text content from the current page.
-        Use this to read post content, comments, or page state as plain text.
+        Return all visible text content from the current page as plain text.
+        Useful for reading post body or comment text in full.
+        For structured page state (buttons, overlays, URL), prefer observe_current_page.
         """
         page = await lazy.get_page()
         try:
@@ -896,7 +1042,9 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
     async def take_screenshot() -> str:
         """
         Take a screenshot of the current page and return it as a base64 PNG string.
-        Use only when accessibility snapshot is insufficient (e.g. visual CAPTCHA).
+        Use only when visual inspection is strictly necessary (e.g. visual CAPTCHA or
+        layout verification). observe_current_page with include_screenshot=True is preferred
+        as it also captures DOM state alongside the image.
         """
         page = await lazy.get_page()
         try:
@@ -917,7 +1065,7 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             "api_key": os.getenv("CAPTCHA_API_KEY"),
             "provider": os.getenv("CAPTCHA_PROVIDER", "2captcha"),
         }
-        proxy_config = {"server": proxy_url} if proxy_url else None
+        proxy_config = _proxy_config(proxy_url)
         try:
             token = await solve_login_recaptcha(
                 page=page,
@@ -930,6 +1078,80 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
             return "CAPTCHA solve returned no token. Check CAPTCHA_API_KEY."
         except Exception as e:
             return f"CAPTCHA solve failed: {e}"
+
+    @tool
+    async def discover_reddit_opportunities(
+        product_name: str,
+        product_description: str,
+        target_customer: str,
+        pain_points: str,
+        use_cases: str,
+        keywords: str,
+        competitor_names: str = "",
+        excluded_subreddits: str = "",
+        target_link_count: int = 100,
+        max_age_days: int = 730,
+        recent_days: int = 7,
+        opportunity_types: str = "",
+        product_url: str = "",
+    ) -> str:
+        """
+        Discover Reddit posts/comments where a SaaS product can be naturally and helpfully mentioned.
+
+        This is a READ-ONLY discovery tool. It does not post, comment, upvote, or spam.
+        Use it when the user asks to find Reddit promotion opportunities, leads, or places
+        to mention their product.
+
+        Args:
+            product_name: Name of the SaaS product (e.g. "Acme CRM").
+            product_description: One-paragraph description of what the product does.
+            target_customer: Who the product is for (e.g. "B2B sales teams", "solo founders").
+            pain_points: Comma-separated list of problems the product solves.
+            use_cases: Comma-separated list of main use cases.
+            keywords: Comma-separated list of search keywords related to the product/problem.
+            competitor_names: Optional comma-separated competitor names for "alternatives" queries.
+            excluded_subreddits: Optional comma-separated subreddits to skip.
+            target_link_count: How many verified results to return (default 100).
+            max_age_days: Exclude posts/comments older than this many days (default 730 = 2 years).
+            recent_days: Posts within this many days go into the 'recent' category (default 7).
+
+        Returns JSON with three categories of results plus a coverage report:
+            recent_posts_comments — posts/comments from the last `recent_days` days
+            high_engagement_posts_comments — high-score or high-comment-count threads
+            high_google_search_posts_comments — Reddit threads ranking on Google for SaaS keywords
+
+        Each result includes url, type, subreddit, title, scores, reason, suggested_angle, and status.
+
+        Backend pipeline (no Playwright required):
+            1. Fetch lightweight Reddit post metadata via the search JSON endpoint,
+               with per-opportunity-type filters (recent uses t=week sort=new,
+               high_engagement uses t=year sort=top, high_google_search uses t=all sort=top).
+            2. Run a match-filter layer on titles to drop off-topic posts before any
+               expensive detail fetch.
+            3. Fetch full body + top comments only for the surviving URLs.
+            4. Send the enriched payload to the LLM for the final fit decision.
+        """
+        try:
+            llm_review = _build_default_llm_review()
+            result = await _discover_opportunities_via_api(
+                product_name=product_name,
+                product_description=product_description,
+                target_customer=target_customer,
+                pain_points=pain_points,
+                use_cases=use_cases,
+                keywords=keywords,
+                competitor_names=competitor_names,
+                excluded_subreddits=excluded_subreddits,
+                target_link_count=target_link_count,
+                max_age_days=max_age_days,
+                recent_days=recent_days,
+                opportunity_types=opportunity_types or None,
+                product_url=product_url,
+                llm_review=llm_review,
+            )
+            return json.dumps(result, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"error": str(exc), "result": None})
 
     return [
         check_session,
@@ -945,8 +1167,11 @@ def make_tools(lazy: LazyBrowser, account_id: str, username: str, password: str,
         upvote_post,
         upvote_comment,
         join_subreddit_tool,
+        observe_current_page,
+        request_confirmation,
         get_accessibility_snapshot,
         get_page_text,
         take_screenshot,
         solve_captcha,
+        discover_reddit_opportunities,
     ]
